@@ -17,8 +17,13 @@ DESIGN RULES THIS FILE ENFORCES
    automatically blocks traffic on the near side. Spillback is not special
    cased. It falls out of the normal car following logic.
 
-3. Vehicles do not turn in this version. Turning needs conflict handling
-   inside the junction box and is planned as a separate later layer.
+3. Vehicles turn left, right, or straight from spawn, using a per-arm split
+   (see MOVEMENT_SPLIT). Turning is visual only: vehicles gap-keep along
+   their own path and against traffic merging onto the same exit lane, but
+   they do not yield to crossing traffic. Because one arm is green at a
+   time, this only shows up as a straggler from one phase still clearing
+   the box as the next phase's traffic arrives - a known, accepted edge
+   case, not something to route around.
 
 RUN
 ---
