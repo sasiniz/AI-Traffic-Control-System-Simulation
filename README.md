@@ -65,11 +65,11 @@ git clone https://github.com/sasiniz/AI-Traffic-Control-System-Simulation.git
 cd AI-Traffic-Control-System-Simulation
 
 # create and activate a virtual environment
-python -m venv trafficai
+python -m venv <environment name>
 # Windows (PowerShell):
-.\trafficai\Scripts\Activate.ps1
+.\<environment name>\Scripts\Activate.ps1
 # macOS / Linux:
-source trafficai/bin/activate
+source <environment name>/bin/activate
 
 # install dependencies
 pip install -r requirements.txt
