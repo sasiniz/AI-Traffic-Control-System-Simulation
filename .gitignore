@@ -2,3 +2,5 @@ trafficai/
 __pycache__/
 *.pyc
 sensor_log.csv
+.claude/
+.vscode/

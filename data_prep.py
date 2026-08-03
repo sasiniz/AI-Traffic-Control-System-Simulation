@@ -1,0 +1,528 @@
+"""
+Stage 1 of the AI pipeline: feature engineering only.
+
+No model training, no prediction, no crypto happens in this file. It reads
+data/traffic_final_cleaned.csv and produces the feature table that Stage 2
+(the Random Forest) will train on.
+
+WHAT THE MODEL ACTUALLY PREDICTS
+---------------------------------
+The Random Forest in this project does NOT predict green-light seconds.
+There are no green-light labels anywhere in the data - it predicts
+VEHICLE COUNTS per road per hour. A separate deterministic layer (Stage 3)
+converts predicted counts into green seconds using Webster's method with UK
+constraints. Keeping these two layers separate is what makes the system
+explainable, which the governance chapter requires. See ADR-007 in
+DECISIONS.md.
+
+WHY EACH FEATURE EXISTS
+------------------------
+Load order: the CSV is parsed and sorted by Road then DateTime before
+anything else happens. Lag and rolling features are computed per road in
+time order; unsorted input would silently produce wrong lags with no error
+at all, so this has to happen first.
+
+Cyclical time features (hour_sin/cos, dow_sin/cos, month_sin/cos): hour 23
+and hour 0 are adjacent in reality. As plain integers a decision tree sees
+them as 23 apart and will split between them instead of learning the
+overnight pattern. Sine/cosine encoding places them next to each other on a
+circle. The same argument applies to Sunday-to-Monday and December-to-
+January.
+
+is_weekend: weekend traffic changes shape, not just volume - the morning
+peak flattens and shifts later. The cyclical day-of-week feature captures
+adjacency but not this categorical break, so both are needed.
+
+One-hot road columns (road_North/South/East/West): the four roads differ by
+roughly 6x in mean volume (North ~45/hr, West ~7/hr). Label-encoding them
+0-3 would imply an ordering between roads that does not exist. One-hot
+lets the model learn each road independently.
+
+lag_168: the Vehicles value at the same hour exactly 168 hours (7 days)
+earlier, per road. Hourly traffic is strongly weekly-periodic, so the same
+hour of the same weekday one week ago is usually the single strongest
+predictor. 168 rather than 24 because a 24-hour lag would compare a Monday
+to a Sunday.
+
+roll_mean_24: rolling mean of Vehicles over the previous 24 hours, per
+road, shifted by 1 so the CURRENT row is never included. This captures the
+recent level of demand. The shift is critical - including the current row
+would leak the target into the feature and the model would look excellent
+for a completely false reason.
+
+DELIBERATELY NO year FEATURE: the dataset only covers 2015, 2016, and half
+of 2017. A tree would use year as a row identifier rather than a
+generalisable pattern, and the model would fail on any unseen year. The
+original project description document listed year as a feature; omitting
+it is a deliberate departure from that document, not an oversight.
+
+DELIBERATELY NO ID FEATURE: the ID column encodes the date, the hour and
+the road all at once (2015-11-01 00:00 East has ID 20151101003, and the
+01:00 row has 20151101013). A tree given that column could memorise
+individual rows instead of learning a pattern. The temporal split would
+partly mask this, because test IDs fall outside the training range and the
+tree would simply clamp - which means the leak would be invisible rather
+than absent. FEATURE_COLUMNS below therefore states the model inputs
+explicitly rather than leaving Stage 2 to infer them.
+
+Rows with NaN lag_168 or roll_mean_24 (the first week of history per road,
+which cannot have a 7-day lag) are dropped, and the count dropped is
+reported when this file is run, so it can be stated in the methodology.
+
+temporal_split() splits on a fixed date, NOT randomly: hourly traffic is
+autocorrelated, so a random 80/20 split would put 09:00 in training and
+10:00 the same day in testing, and the model would score well by
+memorising neighbouring hours rather than learning the underlying pattern.
+A temporal split also mirrors real deployment, where the model predicts a
+future that has not happened yet. See ADR-008.
+
+temporal_split_without_outliers() applies the same split but removes
+flagged rows from TRAIN ONLY. It is NOT used by Stage 2. The Stage 2 count
+predictor trains on ALL rows including peaks, because a forecaster trained
+without peaks underpredicts rush hour, which is exactly when green time
+allocation matters most. See ADR-010.
+
+This function is reserved for the Stage 6 Isolation Forest, where learning
+normal behaviour genuinely is the objective. When Stage 6 uses it, it must
+be changed to key on outlier_trailing rather than Outlier_Flag, for the
+reason given in ADR-009. It currently still keys on Outlier_Flag because
+nothing calls it yet. Neither flag's rows are ever deleted from the CSV,
+only filtered in memory.
+
+Synthetic_Segment_Unverified is kept in the output frame even though it is
+not a model feature: the West road is roughly 70% synthetic and its
+synthetic period ends exactly at the train/test boundary, so West trains
+entirely on synthetic data and tests entirely on real data. Stage 2 must be
+able to report West separately, which is impossible if this column is
+dropped here. See ADR-002.
+
+outlier_trailing IS A SECOND, LEVEL-RELATIVE OUTLIER FLAG
+----------------------------------------------------------
+The CSV's Outlier_Flag is a per-road Tukey fence (Vehicles > Q3 + 1.5*IQR)
+computed ONCE across the whole 20 month period. Demand grew roughly 3x over
+that period, so a fence fixed to the whole-period quartiles drifts into
+flagging ordinary later traffic. Measured: South was 0.0% flagged in every
+quarter of 2016 and 31.6% in 2017 Q2, with nothing anomalous having
+happened. The level moved and the fence did not.
+
+outlier_trailing recomputes the same fence per road from a TRAILING 28 day
+(672 hour) window ending at the previous row, so it tracks the current
+level. Rows without a full window get False, not True: an unknown fence is
+not evidence of an anomaly.
+
+Outlier_Flag is left untouched for provenance and comparison. See ADR-009,
+which records the measured effect on all four roads.
+
+TWO GUARDS ON SILENT FAILURE
+-----------------------------
+_assert_flag_columns_are_bool: temporal_split_without_outliers uses the ~
+operator on Outlier_Flag, which requires bool dtype. The current CSV uses
+uppercase TRUE/FALSE, which pandas parses correctly, but a future
+re-export using 0/1 or Yes/No would make ~ raise a confusing TypeError far
+from the real cause. Checked once, at load time, where the message can name
+the actual problem.
+
+_assert_hourly_series_is_complete: lag_168 uses shift(168), which counts
+ROWS, not hours. That is only correct if every road has a complete,
+unbroken hourly series. It does here (608 days x 24 = 14,592 rows per
+road), but the assumption is invisible in the code, and a single missing
+hour would make lag_168 silently pull the wrong timestamp with no error at
+all. The check makes the assumption explicit and loud.
+"""
+
+import numpy as np
+import pandas as pd
+
+DATA_PATH = "data/traffic_final_cleaned.csv"
+SPLIT_DATE = "2017-01-01"
+LAG_HOURS = 168        # 7 days - see module docstring
+ROLL_WINDOW = 24       # hours - see module docstring
+
+# 28 days. Chosen so the trailing window always contains four of every
+# weekday, which keeps the quartile estimate stable while still tracking
+# the trend. A shorter window would make the fence jumpy; a longer one
+# would drift back towards the whole-period fence this replaces.
+TRAILING_WINDOW_HOURS = 672
+
+# The ONLY columns Stage 2 may use as model inputs.
+#
+# ID is deliberately excluded: it encodes date, hour and road, so a tree
+# could memorise rows through it. There is no year feature, for the reason
+# given in the module docstring.
+#
+# DateTime, Road, Vehicles, Outlier_Flag and Synthetic_Segment_Unverified
+# all stay in the returned frame - they are needed for splitting and for
+# per-road and synthetic-vs-real reporting - but they are NOT features.
+FEATURE_COLUMNS = [
+    "hour_sin", "hour_cos",
+    "dow_sin", "dow_cos",
+    "month_sin", "month_cos",
+    "is_weekend",
+    "road_East", "road_North", "road_South", "road_West",
+    "lag_168", "roll_mean_24",
+]
+TARGET_COLUMN = "Vehicles"
+
+FLAG_COLUMNS = ["Outlier_Flag", "Synthetic_Segment_Unverified"]
+
+
+def _assert_flag_columns_are_bool(df):
+    """
+    Fail loudly if the boolean flag columns did not parse as bool.
+
+    temporal_split_without_outliers uses ~df["Outlier_Flag"], which only
+    works on a bool dtype. If the CSV is ever re-exported with 0/1 or
+    Yes/No, that operator raises a TypeError far from the real cause. This
+    catches it at load time and names the column and the dtype found.
+    """
+    for col in FLAG_COLUMNS:
+        if col not in df.columns:
+            raise ValueError(f"Expected column '{col}' is missing from the CSV.")
+        if df[col].dtype != bool:
+            raise ValueError(
+                f"Column '{col}' parsed as dtype {df[col].dtype}, expected bool. "
+                "The CSV needs re-checking - do not adjust this code to accept "
+                "the other type, because the flag semantics would become unclear."
+            )
+
+
+def _assert_hourly_series_is_complete(df):
+    """
+    Fail loudly if any road's hourly series has gaps or duplicates.
+
+    lag_168 uses shift(168), which is POSITIONAL: it moves 168 rows back,
+    not 168 hours back. Those are the same thing only while every road has
+    a complete, unbroken hourly series. A single missing hour would make
+    lag_168 pull the wrong timestamp with no error raised anywhere. This
+    check is what makes the positional shift safe to rely on.
+    """
+    for road, group in df.groupby("Road"):
+        span_hours = int(
+            (group["DateTime"].max() - group["DateTime"].min())
+            / pd.Timedelta(hours=1)
+        ) + 1
+        if len(group) != span_hours:
+            raise ValueError(
+                f"Road '{road}' has {len(group)} rows but spans {span_hours} "
+                f"hours ({group['DateTime'].min()} to {group['DateTime'].max()}). "
+                "The hourly series has gaps, so the positional shift used by "
+                "lag_168 would silently pull the wrong timestamp."
+            )
+        if group["DateTime"].duplicated().any():
+            n_dupes = int(group["DateTime"].duplicated().sum())
+            raise ValueError(
+                f"Road '{road}' has {n_dupes} duplicate DateTime values, so the "
+                "positional shift used by lag_168 would be misaligned."
+            )
+
+
+def _trailing_outlier_fence(s, window=TRAILING_WINDOW_HOURS):
+    """
+    Tukey upper fence (Q3 + 1.5*IQR) computed on a TRAILING window of one
+    road's series, ending at the PREVIOUS row.
+
+    shift(1) before the rolling window is what stops the current value
+    contributing to the fence that judges it - the same target-leakage
+    argument as roll_mean_24. Rows without a full window return NaN, which
+    the caller turns into False rather than True: an unknown fence is not
+    evidence of an anomaly.
+    """
+    prev = s.shift(1)
+    q1 = prev.rolling(window=window).quantile(0.25)
+    q3 = prev.rolling(window=window).quantile(0.75)
+    return q3 + 1.5 * (q3 - q1)
+
+
+def load_and_engineer(path=DATA_PATH):
+    """
+    Load the raw CSV and return (feature_df, rows_dropped_for_nan).
+
+    feature_df is sorted by Road then DateTime, carries the engineered
+    features described in the module docstring, and keeps
+    Synthetic_Segment_Unverified so Stage 2 can report West separately
+    (see ADR-002). Rows without a full 168-hour lag or 24-hour rolling
+    window are dropped; rows_dropped_for_nan is that count.
+    """
+    df = pd.read_csv(path, parse_dates=["DateTime"])
+
+    # Guard 1: the flag columns must be real booleans - see the helper.
+    _assert_flag_columns_are_bool(df)
+
+    # Sort by Road then DateTime BEFORE any lag/rolling computation - lag
+    # and rolling features are per-road, time-ordered operations, and
+    # unsorted input would silently produce wrong lags with no error.
+    df = df.sort_values(["Road", "DateTime"]).reset_index(drop=True)
+
+    # Guard 2: shift() counts rows, so the series must be gap free. Checked
+    # after the sort and BEFORE any lag or rolling computation.
+    _assert_hourly_series_is_complete(df)
+
+    hour = df["DateTime"].dt.hour                  # 0-23
+    dow = df["DateTime"].dt.dayofweek               # Monday=0 .. Sunday=6
+    month = df["DateTime"].dt.month                 # 1-12
+
+    # Cyclical encoding so hour 23/0, Sunday/Monday and Dec/Jan sit next to
+    # each other on a circle instead of 23 (or 6, or 11) integer steps
+    # apart - see module docstring.
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+    df["month_sin"] = np.sin(2 * np.pi * (month - 1) / 12)
+    df["month_cos"] = np.cos(2 * np.pi * (month - 1) / 12)
+
+    # Weekend traffic changes SHAPE not just volume (later, flatter peak),
+    # a break the cyclical dow feature alone does not capture.
+    df["is_weekend"] = dow.isin([5, 6]).astype(int)
+
+    # One-hot, not label-encoded: roads differ ~6x in mean volume, so an
+    # integer 0-3 label would imply a false ordering between them.
+    road_dummies = pd.get_dummies(df["Road"], prefix="road").astype(int)
+    df = pd.concat([df, road_dummies], axis=1)
+
+    # No `year` feature and no `ID` feature: both would let a tree identify
+    # individual rows rather than learn a generalisable pattern. See the
+    # module docstring and FEATURE_COLUMNS.
+
+    # Same hour, same weekday, one week ago - usually the strongest single
+    # predictor of hourly traffic. 168h not 24h so it never compares a
+    # weekday to a weekend day. Safe to use a positional shift because
+    # _assert_hourly_series_is_complete has already run.
+    df["lag_168"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS)
+
+    # Recent demand level. shift(1) BEFORE the rolling window is what
+    # keeps the current row out of its own feature - without it the
+    # target leaks into the feature and the model looks good for a false
+    # reason.
+    df["roll_mean_24"] = df.groupby("Road")["Vehicles"].transform(
+        lambda s: s.shift(1).rolling(window=ROLL_WINDOW).mean()
+    )
+
+    # Level-relative outlier flag. The CSV's own Outlier_Flag is a Tukey
+    # fence computed ONCE over the whole 20 month period, so as demand grew
+    # roughly 3x it drifted into flagging ordinary later traffic (South:
+    # 0.0% of hours flagged in every quarter of 2016, 31.6% in 2017 Q2).
+    # This recomputes the same fence from a trailing 28 day window so it
+    # tracks the current level. Outlier_Flag is left untouched for
+    # provenance and comparison. See ADR-009.
+    fence = df.groupby("Road")["Vehicles"].transform(_trailing_outlier_fence)
+    df["trailing_fence"] = fence
+    # NaN fence (no full trailing window yet) means "unknown", which is not
+    # evidence of an anomaly, so it becomes False.
+    df["outlier_trailing"] = (df["Vehicles"] > fence).fillna(False)
+
+    before = len(df)
+    # The first LAG_HOURS rows of each road cannot have a 7-day lag yet -
+    # drop them and report how many that is, so it can be stated in the
+    # methodology rather than silently absorbed.
+    df = df.dropna(subset=["lag_168", "roll_mean_24"]).reset_index(drop=True)
+    rows_dropped_for_nan = before - len(df)
+
+    return df, rows_dropped_for_nan
+
+
+def feature_matrix(df):
+    """
+    Return (X, y) using ONLY the columns named in FEATURE_COLUMNS.
+
+    Stage 2 must call this rather than selecting columns itself. If a
+    feature is ever renamed or dropped, this raises here with the column
+    named, instead of silently changing what the model trains on.
+    """
+    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing feature column(s): {missing}. FEATURE_COLUMNS defines the "
+            "model inputs - fix the engineering step or update FEATURE_COLUMNS "
+            "deliberately, do not select columns ad hoc in Stage 2."
+        )
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Missing target column '{TARGET_COLUMN}'.")
+    return df[FEATURE_COLUMNS].copy(), df[TARGET_COLUMN].copy()
+
+
+def temporal_split(df, split_date=SPLIT_DATE):
+    """
+    Train = rows before split_date, test = rows on/after it. NOT random -
+    hourly traffic is autocorrelated, so a random split would let the
+    model memorise neighbouring hours instead of learning the pattern, and
+    would not mirror real deployment (predicting a future not yet seen).
+    See ADR-008.
+    """
+    train = df[df["DateTime"] < split_date].reset_index(drop=True)
+    test = df[df["DateTime"] >= split_date].reset_index(drop=True)
+    return train, test
+
+
+def temporal_split_without_outliers(df, split_date=SPLIT_DATE):
+    """
+    Same temporal split, but flagged rows are removed from TRAIN ONLY.
+
+    NOT USED BY STAGE 2. The count predictor trains on all rows including
+    peaks - excluding them would make it underpredict rush hour, which is
+    exactly when green time allocation matters. See ADR-010.
+
+    Reserved for the Stage 6 Isolation Forest, where learning normal
+    behaviour is the objective. When Stage 6 uses it, switch the key from
+    Outlier_Flag to outlier_trailing (ADR-009). Rows stay in test either
+    way, because dropping them from test would flatter the score. Never
+    deleted from the CSV itself, only filtered here in memory.
+    """
+    train, test = temporal_split(df, split_date)
+    train_no_outliers = train[~train["Outlier_Flag"]].reset_index(drop=True)
+    return train_no_outliers, test
+
+
+if __name__ == "__main__":
+    raw = pd.read_csv(DATA_PATH, parse_dates=["DateTime"])
+
+    print("=== Raw data ===")
+    print(f"Total rows loaded: {len(raw)}")
+    per_road = raw.groupby("Road").size()
+    print("Rows per road:")
+    print(per_road.to_string())
+    print(f"DateTime range: {raw['DateTime'].min()} to {raw['DateTime'].max()}")
+
+    synthetic = raw[raw["Synthetic_Segment_Unverified"]]
+    print("Synthetic_Segment_Unverified True rows per road:")
+    if len(synthetic) > 0:
+        print(synthetic.groupby("Road").size().to_string())
+    else:
+        print("  none")
+    west_synth = synthetic[synthetic["Road"] == "West"]
+    if len(west_synth) > 0:
+        print(f"West synthetic period: {west_synth['DateTime'].min()} to "
+              f"{west_synth['DateTime'].max()}, count={len(west_synth)}")
+    else:
+        print("West synthetic period: none found")
+
+    outlier_count = int(raw["Outlier_Flag"].sum())
+    print(f"Outlier_Flag True rows (all roads): {outlier_count}")
+
+    # --- compare against the expected state, on the RAW data only -------
+    print()
+    print("=== Expected value check (raw data) ===")
+    mismatches = []
+
+    if len(raw) != 58368:
+        mismatches.append(f"total rows: expected 58368, got {len(raw)}")
+
+    for road, n in per_road.items():
+        if n != 14592:
+            mismatches.append(f"rows for {road}: expected 14592, got {n}")
+
+    if raw["DateTime"].min().date() != pd.Timestamp("2015-11-01").date():
+        mismatches.append(
+            f"min DateTime: expected 2015-11-01, got {raw['DateTime'].min().date()}")
+    if raw["DateTime"].max().date() != pd.Timestamp("2017-06-30").date():
+        mismatches.append(
+            f"max DateTime: expected 2017-06-30, got {raw['DateTime'].max().date()}")
+
+    if len(west_synth) > 0:
+        if west_synth["DateTime"].min().date() != pd.Timestamp("2015-11-01").date():
+            mismatches.append(
+                "West synthetic start: expected 2015-11-01, got "
+                f"{west_synth['DateTime'].min().date()}")
+        if west_synth["DateTime"].max().date() != pd.Timestamp("2016-12-31").date():
+            mismatches.append(
+                "West synthetic end: expected 2016-12-31, got "
+                f"{west_synth['DateTime'].max().date()}")
+    else:
+        mismatches.append("West synthetic period: expected 10248 rows, found none")
+    if len(west_synth) != 10248:
+        mismatches.append(
+            f"West synthetic row count: expected 10248, got {len(west_synth)}")
+
+    if outlier_count != 1593:
+        mismatches.append(f"Outlier_Flag rows: expected 1593, got {outlier_count}")
+
+    if mismatches:
+        print("MISMATCH vs expected values:")
+        for m in mismatches:
+            print(" -", m)
+    else:
+        print("All checked values match the expected state.")
+
+    # --- feature engineering ---------------------------------------------
+    print()
+    print("=== Feature engineering ===")
+    features, rows_dropped_for_nan = load_and_engineer(DATA_PATH)
+    print("Integrity guards passed: flag columns are bool, hourly series is "
+          "gap free and has no duplicate timestamps.")
+    print(f"Rows dropped for NaN lag_168 or roll_mean_24: {rows_dropped_for_nan}")
+    print(f"Final row count: {len(features)}")
+    print(f"Columns ({len(features.columns)}): {list(features.columns)}")
+
+    # --- feature matrix ---------------------------------------------------
+    print()
+    print("=== Feature matrix ===")
+    X, y = feature_matrix(features)
+    print(f"X shape: {X.shape}   y shape: {y.shape}")
+    print(f"X columns match FEATURE_COLUMNS in order: "
+          f"{list(X.columns) == FEATURE_COLUMNS}")
+    print(f"X columns ({len(X.columns)}): {list(X.columns)}")
+    excluded = [c for c in features.columns if c not in FEATURE_COLUMNS]
+    print(f"Deliberately excluded from X: {excluded}")
+
+    train, test = temporal_split(features)
+    print()
+    print("=== Temporal split ===")
+    print(f"Train rows: {len(train)}")
+    print(f"Test rows: {len(test)}")
+
+    print("Mean Vehicles per road, train:")
+    print(train.groupby("Road")["Vehicles"].mean().round(2).to_string())
+    print("Mean Vehicles per road, test:")
+    print(test.groupby("Road")["Vehicles"].mean().round(2).to_string())
+
+    print()
+    print("Synthetic rows per road, train:")
+    print(train.groupby("Road")["Synthetic_Segment_Unverified"].sum().to_string())
+    print("Synthetic rows per road, test:")
+    print(test.groupby("Road")["Synthetic_Segment_Unverified"].sum().to_string())
+
+    train_no_outliers, _test_same = temporal_split_without_outliers(features)
+    removed = len(train) - len(train_no_outliers)
+    print()
+    print(f"Outlier filter removes {removed} rows from train (test unchanged)")
+
+    # --- outlier flag comparison -----------------------------------------
+    # The point of this section: Outlier_Flag uses a whole-period fence and
+    # therefore drifts as demand grows, while outlier_trailing uses a fence
+    # that tracks the current level. If the two disagree mainly in the later
+    # quarters, that confirms the original flag is partly a date proxy.
+    # See ADR-009.
+    print()
+    print("=== Outlier flag comparison ===")
+    no_window = int((~features["trailing_fence"].notna()).sum())
+    print(f"Rows with no full {TRAILING_WINDOW_HOURS}h trailing window "
+          f"(outlier_trailing forced False): {no_window}")
+
+    print()
+    print("Total flagged rows, per road:")
+    comp = pd.DataFrame({
+        "Outlier_Flag": features.groupby("Road")["Outlier_Flag"].sum(),
+        "outlier_trailing": features.groupby("Road")["outlier_trailing"].sum(),
+    })
+    print(comp.to_string())
+
+    print()
+    print("Agreement rate between the two flags, per road:")
+    agree = features.groupby("Road").apply(
+        lambda g: (g["Outlier_Flag"] == g["outlier_trailing"]).mean() * 100,
+        include_groups=False,
+    ).round(1)
+    print(agree.to_string())
+
+    print()
+    print("Percent of hours flagged by quarter (old = Outlier_Flag, "
+          "new = outlier_trailing):")
+    q = features.copy()
+    q["quarter"] = q["DateTime"].dt.to_period("Q").astype(str)
+    old_q = (q.pivot_table(index="quarter", columns="Road",
+                           values="Outlier_Flag", aggfunc="mean") * 100).round(1)
+    new_q = (q.pivot_table(index="quarter", columns="Road",
+                           values="outlier_trailing", aggfunc="mean") * 100).round(1)
+    side = pd.concat({"old": old_q, "new": new_q}, axis=1).swaplevel(axis=1)
+    side = side.reindex(columns=["East", "North", "South", "West"], level=0)
+    print(side.to_string())
