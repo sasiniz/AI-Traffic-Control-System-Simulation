@@ -220,22 +220,37 @@ def _bezier_length(p0, c, p2, samples=16):
 # =============================================================================
 # SECTION 5 - PRE-PLANNED SIGNAL SCHEDULE
 # =============================================================================
-# This stands in for the annual schedule the Random Forest model will produce.
-# Key = hour of day. Value = (green seconds for North/South, green seconds for
-# East/West). North and South now take turns using the first number; East and
-# West take turns using the second number. One arm is green at a time.
-# Replace this table with the model output later. Nothing else needs to change.
+# The signal program is not computed here. It is loaded, already fully
+# spelled out phase by phase, from SIGNAL_TIMELINE_PATH - the CSV produced
+# by generate_timeline.py's compile_timeline(). Each row is one phase: a
+# road, its green seconds, and its amber seconds, laid out so every hour of
+# real schedule sums to exactly 3600 seconds. When the Random Forest
+# scheduler is ready, replacing the CSV at this path with its real annual
+# output is the only change needed - nothing in SignalController changes.
+#
+# Playback is independent of the simulation's own clock (START_HOUR and
+# elapsed sim_time): it starts at the first row and loops back to the start
+# once the file is exhausted. The CSV's own start_hour column is provenance
+# information, not something the simulation actively synchronises against.
 
-HOURLY_SCHEDULE = {
-    0: (18, 18), 1: (18, 18), 2: (18, 18), 3: (18, 18),
-    4: (20, 18), 5: (24, 20), 6: (30, 22), 7: (38, 24),
-    8: (42, 26), 9: (34, 24), 10: (28, 24), 11: (28, 24),
-    12: (30, 26), 13: (30, 26), 14: (28, 24), 15: (30, 26),
-    16: (36, 28), 17: (42, 30), 18: (40, 28), 19: (32, 26),
-    20: (26, 22), 21: (22, 20), 22: (20, 18), 23: (18, 18),
-}
+SIGNAL_TIMELINE_PATH = os.path.join(os.path.dirname(__file__),
+                                    "signal_timeline_sample.csv")
 
-AMBER_S = 3.0                    # amber time between phases
+
+def _load_signal_timeline(path):
+    """Read a generate_timeline.py CSV into a list of phase dicts."""
+    phases = []
+    with open(path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            phases.append({
+                "road": row["road"],
+                "green": float(row["green_seconds"]),
+                "amber": float(row["amber_seconds"]),
+            })
+    if not phases:
+        raise ValueError(f"{path} has no phase rows")
+    return phases
+
 
 # Approximate arrivals per hour per arm, by hour of day.
 # This is a placeholder for traffic_final_cleaned.csv.
@@ -298,12 +313,12 @@ GREEN, AMBER, RED = "GREEN", "AMBER", "RED"
 # =============================================================================
 class SignalController:
     """
-    Runs the pre-planned fixed cycle.
+    Plays back the pre-planned phase list loaded from SIGNAL_TIMELINE_PATH.
 
-    Exactly one arm is green at a time. The cycle visits the four arms in
-    ARMS order (North, South, East, West), separated by an amber gap, so two
-    roads are never green together and a turning vehicle only ever shares
-    the junction with traffic from its own approach.
+    Exactly one arm is green at a time - that invariant comes from how
+    generate_timeline.py compiles the file, not from anything checked here.
+    This class only ever steps forward through the list it was given; it
+    does not compute timings itself.
 
     This class deliberately has NO reference to accidents or queues.
     That is the whole point of the project design. If a future version ever
@@ -311,33 +326,24 @@ class SignalController:
     a change here.
     """
 
-    def __init__(self):
-        self.phase_index = 0
-        self.phase = ARMS[self.phase_index]   # which arm currently has green
+    def __init__(self, timeline_path=SIGNAL_TIMELINE_PATH):
+        self.timeline = _load_signal_timeline(timeline_path)
+        self.phase_pos = 0             # index into self.timeline
+        self.phase = self.timeline[0]["road"]   # which arm currently has green
         self.in_amber = False
         self.timer = 0.0
-        self.hour = START_HOUR
-        self._set_durations()
 
-    def _set_durations(self):
-        ns, ew = HOURLY_SCHEDULE[self.hour % 24]
-        self.green_len = {"North": float(ns), "South": float(ns),
-                           "East": float(ew), "West": float(ew)}
-
-    def update(self, dt, hour):
-        if hour != self.hour:
-            self.hour = hour
-            self._set_durations()
-
+    def update(self, dt):
         self.timer += dt
+        current = self.timeline[self.phase_pos]
         if self.in_amber:
-            if self.timer >= AMBER_S:
+            if self.timer >= current["amber"]:
                 self.timer = 0.0
                 self.in_amber = False
-                self.phase_index = (self.phase_index + 1) % len(ARMS)
-                self.phase = ARMS[self.phase_index]
+                self.phase_pos = (self.phase_pos + 1) % len(self.timeline)
+                self.phase = self.timeline[self.phase_pos]["road"]
         else:
-            if self.timer >= self.green_len[self.phase]:
+            if self.timer >= current["green"]:
                 self.timer = 0.0
                 self.in_amber = True
 
@@ -349,19 +355,23 @@ class SignalController:
 
     def remaining(self, arm):
         """Seconds left until this arm's state next changes, for the panel."""
+        current = self.timeline[self.phase_pos]
         if arm == self.phase:
             if self.in_amber:
-                return max(0.0, AMBER_S - self.timer)
-            return max(0.0, self.green_len[arm] - self.timer)
-        # Red: time until this arm's own turn comes around the cycle.
+                return max(0.0, current["amber"] - self.timer)
+            return max(0.0, current["green"] - self.timer)
+        # Red: time until this arm's own turn comes around the timeline.
         if self.in_amber:
-            t = max(0.0, AMBER_S - self.timer)
+            t = max(0.0, current["amber"] - self.timer)
         else:
-            t = max(0.0, self.green_len[self.phase] - self.timer) + AMBER_S
-        idx = (self.phase_index + 1) % len(ARMS)
-        while ARMS[idx] != arm:
-            t += self.green_len[ARMS[idx]] + AMBER_S
-            idx = (idx + 1) % len(ARMS)
+            t = max(0.0, current["green"] - self.timer) + current["amber"]
+        idx = (self.phase_pos + 1) % len(self.timeline)
+        for _ in range(len(self.timeline)):
+            phase = self.timeline[idx]
+            if phase["road"] == arm:
+                break
+            t += phase["green"] + phase["amber"]
+            idx = (idx + 1) % len(self.timeline)
         return t
 
 
@@ -916,7 +926,7 @@ class Simulation:
         dt_frames = dt_seconds * 60.0        # movement constants are per frame
         self.sim_time += dt_seconds
 
-        self.signals.update(dt_seconds, self.hour)
+        self.signals.update(dt_seconds)
         self._try_spawn(dt_seconds)
 
         # Green time per arm feeds the anomaly rule. Without it the detector
