@@ -518,3 +518,495 @@ different filtering.
 The data_prep.py docstring was corrected on 2026-08-03 to match this
 decision. Before that correction it stated the opposite, and a Stage 2
 implementation reading only the docstring would have excluded the peaks.
+
+---
+
+## ADR-011: Overall metrics exclude West
+
+**Date:** 2026-08-04
+**Status:** Accepted
+
+**Context**
+ADR-002 established that West trains entirely on synthetic data and tests
+entirely on real data, so its error measures how closely the synthetic
+generator resembles real West traffic rather than how well the model
+forecasts West traffic. It records that West must never be averaged into
+a headline figure, but does not say what a headline figure should then
+contain.
+
+**Decision**
+Every overall MAE and RMSE in the evaluation is computed over East, North
+and South only, and is labelled OVERALL_excl_West. West is always
+reported on its own clearly separated line. This applies to the naive
+baseline as well as to the model, so the two overall figures cover the
+same population and can be compared directly.
+
+**Alternatives rejected**
+Reporting a four road overall alongside the three road one. Rejected
+because two similar looking headline numbers invite the wrong one being
+quoted, and the four road figure has no valid interpretation.
+Weighting West down rather than excluding it. Rejected because any weight
+would be arbitrary and would still blend two different measurements.
+
+**Consequences**
+Measured naive baseline over East, North and South: MAE 5.22, RMSE 9.27.
+The four road figure, MAE 4.58 and RMSE 8.23, is lower only because West
+is both low volume and synthetic. That four road figure appears in the
+early Stage 2 output and in this project's history; it must not be quoted
+as a result.
+Any future evaluation script must apply the same exclusion to both
+baseline and model, or the comparison becomes meaningless.
+
+**Sources**
+None, design decision. Metrics measured on 2026-08-04.
+
+---
+
+## ADR-012: Schedule regenerated weekly, not annually
+
+**Date:** 2026-08-04
+**Status:** Accepted
+**Amends the deployment horizon described in CLAUDE.md and in the
+submitted project description. Does not affect ADR-004, ADR-005 or
+ADR-006, which concern how a schedule block is compiled rather than how
+far ahead it is compiled.**
+
+**Context**
+The project description and CLAUDE.md both stated that the AI generates a
+full year of hourly signal timings in advance. Two of the model's
+thirteen features make that impossible:
+
+    lag_168       vehicle count 168 hours (7 days) earlier
+    roll_mean_24  mean of the previous 24 hours
+
+Neither value exists when planning a year ahead. Predicting 14:00 next
+July requires the count from seven days before next July, which has not
+happened. The model as built can forecast roughly one week ahead, not one
+year.
+
+The obvious alternative, dropping both features so only calendar features
+remain, was measured on 2026-08-04:
+
+    Road    mean actual    calendar-only prediction    MAE
+    North       64.94              31.05              33.90
+    South       21.34              10.63              10.73
+    East        17.56              11.59               7.13
+    West         7.25               7.23               2.27
+
+North is predicted at less than half its actual volume. The allocation
+layer would give North roughly half the green time it needs, every hour,
+all year.
+
+The cause is structural rather than a tuning problem. Demand roughly
+tripled across the dataset (ADR-008), and a Random Forest predicts the
+mean of the training rows in a leaf, so it can never output a value above
+its training range. Without lag_168 and roll_mean_24 nothing carries the
+level forward, and the model predicts the 2016 average into 2017. No
+hyperparameter changes this, because averaging leaf values is what a
+forest does. West appears unaffected only because its training data is
+synthetic and flat, so there is no trend to miss.
+
+**Decision**
+The schedule is regenerated weekly (or monthly, to be fixed at Stage 3)
+from the most recent available data, rather than once annually. The word
+"annually" is removed from the project's description of its own
+deployment model.
+
+**Alternatives rejected**
+Keeping the annual horizon and accepting calendar-only accuracy. Rejected
+because North being underpredicted by 52 percent makes the Stage 3
+allocation layer meaningless, and every downstream result would rest on
+numbers already known to be wrong.
+Recursive forecasting: predict week 1, feed those predictions back in as
+the lag features for week 2, and iterate. Rejected because error compounds
+over 52 iterations and the complexity is not justified at this scope.
+Training two models, a short horizon one with lag features and a long
+horizon calendar-only one, and reporting both. Not rejected on merit, and
+the calendar-only measurement above is retained as evidence. Rejected as a
+deployment design because a schedule that is known to be wrong should not
+be deployable at all, even as an option.
+
+**Consequences**
+The academic core of the project is unaffected. The unbreakable rule is
+that signal timing is PRE-PLANNED and never reacts to a live incident. A
+weekly regenerated schedule is still compiled offline, still human
+authenticated before deployment, and still blind to accidents, queues and
+anomalies. SignalController still holds no timing logic. Only the
+regeneration interval changes.
+The security architecture arguably strengthens. A schedule redeployed
+weekly passes through the authentication and signing workflow fifty two
+times a year instead of once, so replay protection and sequence numbering
+become load bearing rather than decorative.
+CLAUDE.md must be corrected: it currently states the annual horizon in
+the "one rule that must never break" section, which risks a future
+session treating the wrong horizon as the protected invariant.
+The methodology chapter must state this as a deliberate amendment to the
+submitted project description, alongside ADR-007 and ADR-008, and should
+present the calendar-only measurement as the evidence for it. This is a
+finding, not a retreat: it demonstrates empirically that annual
+pre-planning is not achievable on a non-stationary series with a
+tree-based model.
+
+**Sources**
+None, design decision. Calendar-only measurement performed on 2026-08-04
+using the same data, split and model configuration as Stage 2.
+
+---
+
+## ADR-013: Model hyperparameters tuned on a validation split, artefact not committed
+
+**Date:** 2026-08-04
+**Status:** Accepted
+
+**Context**
+Stage 2 trained with n_estimators=300 and sklearn defaults for max_depth
+and min_samples_leaf. Default min_samples_leaf=1 with unlimited depth
+grows every tree until each leaf holds a single training row, so the
+forest effectively stores the 40,320 row training set 300 times. The saved
+artefact was 896 MB, above GitHub's 100 MB limit for plain git, and
+unwieldy for a "sign and deploy" workflow.
+
+Raising min_samples_leaf reduces the artefact substantially, but choosing
+its value by comparing test set error would turn the held-out future into
+training data and would destroy the honest evaluation established in
+ADR-008 and ADR-011.
+
+**Decision**
+min_samples_leaf and any other hyperparameter are chosen on a validation
+split carved TEMPORALLY out of the training set (November and December
+2016), never on the test set. The test set is evaluated exactly once,
+after the configuration is fixed.
+The model is saved with joblib compress=3.
+models/count_model.joblib is added to .gitignore.
+models/model_card.json IS committed.
+
+**Alternatives rejected**
+Choosing min_samples_leaf by comparing test set error across candidate
+values. Rejected as test set leakage. Note for the record: on 2026-08-04
+test set error WAS observed across four candidate values during
+investigation of the artefact size problem. Those observations are
+therefore contaminated and are not used to select the value. The
+validation procedure above is run independently.
+Git LFS for the artefact. Rejected as unnecessary complexity for a file
+that is fully reproducible from committed code, committed data and a
+pinned random_state.
+Committing the compressed artefact. Rejected because it would still be
+large, would grow the repository on every retrain, and adds nothing that
+the model card plus a pinned seed does not already provide.
+
+**Consequences**
+The model is reproducible rather than stored: data_prep.py, train_model.py,
+data/traffic_final_cleaned.csv and random_state=42 together regenerate it
+in roughly 13 seconds. The model card records the training provenance,
+which is what Stage 7 needs in order for an operator approval to mean
+anything.
+Reported accuracy will change from the Stage 2 figures once
+min_samples_leaf is fixed, so the Stage 2 numbers are superseded and must
+not be quoted as final results.
+A separate finding emerged and is recorded here because it constrains
+tuning: North's error RISES as min_samples_leaf rises. North is smooth and
+strongly trending, so larger leaves mean more averaging, and averaging
+pulls predictions toward the lower training mean. This is why no
+hyperparameter setting makes the model beat the naive lag_168 baseline on
+North. The problem is not overfitting.
+
+**Sources**
+None, design decision.
+
+---
+
+## ADR-014: Stage 2 result recorded, decision on the model deferred
+
+**Date:** 2026-08-04
+**Status:** Accepted
+
+**Context**
+Stage 2 measured the Random Forest against a seasonal naive baseline
+(predict each hour as the same hour one week earlier, which is lag_168
+used directly). Result on the test set, min_samples_leaf=1:
+
+    Road    Baseline MAE/RMSE    Model MAE/RMSE    Beat baseline?
+    East       6.49 / 12.54       4.69 /  8.86          YES
+    North      6.30 /  9.31       7.27 / 10.62          NO
+    South      2.88 /  3.73       3.08 /  4.23          NO
+    West       2.65 /  3.66       2.03 /  2.76          YES
+    OVERALL    5.22 /  9.27       5.02 /  8.35          marginal
+
+The model loses to a one line baseline on two of the four roads.
+
+The explanation is consistent across both roads. North and South are
+smooth and trending. lag_168 alone already carries the daily shape and the
+current level exactly. A forest averages the training rows in each leaf,
+and that averaging pulls every prediction toward the training mean, which
+is lower than the test period. North's mean actual is 64.94 against a mean
+prediction of 61.26. East, which is spiky (maximum 180 against a mean of
+17), is where averaging helps and the model wins clearly.
+
+**Decision**
+Record the result. Do not decide the model's fate yet. Re-measure after
+ADR-013's validation-based tuning is complete, then decide.
+
+**Alternatives rejected**
+Discarding the Random Forest now and using the naive baseline throughout.
+Premature: the tuning in ADR-013 has not been run, and the model already
+wins clearly on East and West.
+Quietly proceeding to Stage 3 without recording that the model loses on
+two roads. Rejected outright. The comparison against a baseline exists
+precisely so this cannot pass silently, and a model that fails to beat a
+one line rule is a reportable finding rather than an embarrassment.
+Tuning until the model beats the baseline everywhere. Rejected because
+that is selecting on the outcome, and because ADR-013 shows the direction
+of tuning that helps East and South makes North worse.
+
+**Consequences**
+A hybrid remains open as a Stage 3 option: use the seasonal naive
+prediction on smooth roads and the model on spiky ones. It would need its
+own ADR and its own justification, and it complicates the single-artefact
+signing story in ADR-013, so it is not adopted by default.
+One test row is worth carrying forward to Stage 6: East on 2017-02-23 at
+19:00, actual 180 against a prediction of 25.7. The model was not merely
+capped at its training maximum of 134, it predicted 26, meaning neither
+lag_168 nor roll_mean_24 gave any warning. That is an anomaly rather than
+a forecasting failure, and it is exactly the class of event the Isolation
+Forest exists to detect.
+A note on an apparent inconsistency in the records: ADR-008 states that
+0.1 to 1.5 percent of test rows per road exceed the training maximum,
+while the Stage 2 run reports 0.06 percent. Both are correct. ADR-008
+measured each road against that road's own training maximum; the trained
+model has one global training maximum of 134 across all four roads. The
+per-road figure is the relevant one when reasoning about a per-road model,
+the global figure when reasoning about the single model actually built.
+
+**Sources**
+None, measurement record. Figures produced on 2026-08-04 by
+train_model.py at min_samples_leaf=1.
+---
+
+## ADR-015: Feature set corrected for the schedule-generation horizon
+
+**Date:** 2026-08-04
+**Status:** Accepted
+**Amends the FEATURE_COLUMNS list established at Stage 1. Supersedes the
+conclusion of ADR-014, which was measured on a feature set that cannot be
+deployed. Does not affect ADR-008 (the temporal split) or ADR-012 (the
+weekly horizon), both of which stand.**
+
+**Context**
+The Stage 1 feature set was chosen by reasoning about traffic behaviour in
+general, not by inspecting this dataset. Exploratory analysis was
+therefore performed after modelling rather than before it, which is the
+wrong order. This entry records what that analysis found when it was
+finally done, on 2026-08-04.
+
+The central finding concerns feature LEGALITY rather than feature quality.
+Under the weekly regeneration horizon fixed in ADR-012, a schedule for
+Monday to Sunday is compiled in one batch at generation time. A feature is
+only usable if it is computable for the FURTHEST hour in that week, which
+is 168 hours after generation:
+
+    lag_1           needs data 1h before the target      ILLEGAL
+    lag_24          needs data 24h before the target     ILLEGAL
+    roll_mean_24    needs the 24h immediately before     ILLEGAL
+    lag_168         needs data 168h before the target    LEGAL (just)
+    lag_336         needs data 336h before the target    LEGAL
+    roll_168_lag168 168h mean ending 168h before target  LEGAL
+
+roll_mean_24 is therefore unusable in deployment. It was the highest
+ranked feature in the Stage 2 permutation importance, at 0.6029. The Stage
+2 model's strongest predictor cannot exist when the model is actually run.
+
+**Decision**
+Replace roll_mean_24 with lag_336 and roll_168_lag168. FEATURE_COLUMNS
+goes from 13 entries to 14:
+
+    hour_sin, hour_cos, dow_sin, dow_cos, month_sin, month_cos,
+    is_weekend, road_East, road_North, road_South, road_West,
+    lag_168, lag_336, roll_168_lag168
+
+roll_168_lag168 is defined as s.shift(168).rolling(168).mean() per road:
+the mean of the 168 hours ending 168 hours before the target hour.
+
+**Alternatives rejected**
+Keeping roll_mean_24 and accepting that the model cannot be deployed.
+Rejected outright.
+Replacing roll_mean_24 with lag_168 alone. Measured on validation and
+rejected: overall MAE rises from 3.51 (illegal set) to 6.65, which is
+worse than the seasonal naive baseline at 4.55. Removing the level
+information entirely is not survivable.
+Replacing it with a 24-hour mean shifted by 168 (roll_24_lag168) rather
+than a 168-hour one. Measured at 5.67, worse than the 168-hour window at
+4.54. The wider window carries the demand level more stably.
+Dropping to calendar features only, which is the configuration an annual
+horizon would require. Measured at 15.10 overall, with North predicted at
+32.07 MAE. This is the measurement that also underpins ADR-012.
+
+**Consequences**
+Validation results, fit on rows before 2016-11-01 and validated on
+November and December 2016. The test set was NOT touched. MAE, lower is
+better:
+
+    Feature set                            North  South  East  West  EXNS
+    Current (illegal): lag168+roll_mean_24  4.91   1.97  3.64  2.31  3.51
+    lag_168 only                            9.46   4.84  5.65  2.36  6.65
+    lag_168 + roll_24_lag168                8.40   3.84  4.78  2.34  5.67
+    lag_168 + roll_168_lag168               6.07   2.94  4.62  2.34  4.54
+    lag_168 + lag_336 + roll_168_lag168     5.97   2.51  4.28  2.35  4.25
+    Calendar only                          32.07   5.44  7.79  2.33 15.10
+    Seasonal naive baseline (lag_168)       6.06   2.51  5.07  3.14  4.55
+
+The chosen set costs accuracy against the illegal set, 4.25 against 3.51,
+which is the honest price of a deployable model. It nonetheless beats the
+seasonal naive baseline overall (4.25 against 4.55), wins clearly on East
+and West, and ties on North and South. It does not lose on any road.
+
+This materially changes the picture recorded in ADR-014, which found the
+model losing to the baseline on North and South. That result was measured
+on the illegal feature set. It has NOT yet been re-measured on the test
+set with the corrected features, and must not be quoted as though it had.
+The validation figures above are validation figures.
+
+lag_168 is confirmed as the correct lag among the legal options, by
+detrended autocorrelation (672-hour centred rolling mean removed, because
+the raw series is inflated at every lag by the demand trend):
+
+    Road    lag 24   lag 168   lag 336
+    North     0.71      0.90      0.89
+    South     0.59      0.77      0.76
+    East      0.49      0.33      0.29
+    West      0.36      0.36      0.38
+
+North and South are strongly weekly-periodic. East is more strongly
+DAILY-periodic (0.49 at lag 24 against 0.33 at lag 168), but lag_24 is
+illegal, so lag_168 remains the best available choice rather than the best
+possible one. This limitation should be stated in the evaluation: East is
+the road the feature set serves least well, and it is also the road where
+the model most clearly beats the baseline, because its spikiness is where
+averaging helps.
+
+Stage 2 must be re-run in full after this change. The existing
+models/model_card.json and its reported metrics are superseded.
+
+**Sources**
+None, measurement record. All figures produced on 2026-08-04 by
+explore_features.py and by validation sweeps over the same data, split and
+model configuration.
+
+---
+
+## ADR-016: month_sin, month_cos and is_weekend retained
+
+**Date:** 2026-08-04
+**Status:** Accepted
+
+**Context**
+The Stage 2 permutation importance scored month_sin, month_cos and
+is_weekend at or below zero, which suggested they contributed nothing and
+could be removed. An ablation was run to test that.
+
+**Decision**
+Keep all three. FEATURE_COLUMNS retains month_sin, month_cos and
+is_weekend.
+
+**Alternatives rejected**
+Dropping month_sin, month_cos and is_weekend, reducing the feature set
+from 14 to 11. Rejected on measurement.
+
+**Consequences**
+A first ablation at 100 trees showed every variant landing between 4.25
+and 4.29 validation MAE, which appeared to show the calendar features
+contributed nothing. That reading was wrong: the differences were smaller
+than the seed-to-seed noise, which had not been measured.
+
+Re-run at 300 trees across five random seeds:
+
+    Full, 14 features                  MAE 4.2021, sd 0.0119
+    Without month and is_weekend, 11   MAE 4.2627, sd 0.0086
+
+The gap of 0.06 is roughly five standard deviations, so it is real.
+Dropping the three features makes the model worse.
+
+The lesson is worth recording separately from the result: a difference
+cannot be called negligible until the noise floor is known. The first
+ablation would have removed three useful features on the strength of
+noise.
+
+Two further points follow. First, permutation importance at or below zero
+does not mean a feature is useless; it means the feature's contribution is
+smaller than the noise in that particular measurement. Second, is_weekend
+justifies itself differently on different roads. On North the weekend is
+simply quieter (49.77 against 33.20 mean vehicles per hour). On East the
+means are nearly identical (13.79 against 13.44) but the SHAPES differ
+sharply: the weekend runs lower through the day, then spikes to 26.5 at
+hour 20 against a weekday 18.8. A comparison of means alone hides that
+entirely, which is why the feature earns its place on East too.
+
+**Sources**
+None, measurement record. Ablation and seed-variance figures produced on
+2026-08-04.
+
+---
+
+## ADR-017: Exploratory analysis figures retained as report artefacts
+
+**Date:** 2026-08-04
+**Status:** Accepted
+
+**Context**
+The exploratory analysis behind ADR-015 and ADR-016 produced eight
+figures. They are evidence for feature choices that the methodology
+chapter must justify, so they need to be reproducible rather than
+one-off screenshots.
+
+**Decision**
+explore_features.py is committed and produces all eight figures
+deterministically from data/traffic_final_cleaned.csv. figures/ is
+committed. export_features.py writes data/feature_table.csv, the full
+Stage 1 feature frame with a split column, so individual rows can be
+inspected by eye.
+
+**Alternatives rejected**
+Generating the figures once by hand and keeping only the images. Rejected
+because a figure whose generating code is lost cannot be corrected or
+regenerated when the feature set changes, and the feature set is changing
+in ADR-015.
+Gitignoring figures/ and regenerating on demand. Rejected because the
+figures are report deliverables, they total under 1.5 MB, and a reader of
+the repository should be able to see what the report cites.
+
+**Consequences**
+The figures must be regenerated after the ADR-015 feature change, because
+Figure 8 currently labels roll_mean_24 as "currently in data_prep.py",
+which will no longer be true.
+
+Two defects were found in these figures during review and are recorded
+because they illustrate what automated checking cannot catch:
+
+Figure 8 originally drew roll_168_lag168 as a 24-hour window when it is a
+168-hour window. All ten items of the automated review passed regardless,
+because a schematic diagram has no numbers to verify against. Only a human
+read found it.
+
+Figure 4 originally shaded the whole plot area from 2015-11 to 2017-01 and
+labelled it "West synthetic period". Only West is synthetic in that
+period. The shading placed North's genuine rise from 20 to 58 vehicles per
+hour inside a band captioned as synthetic, which worked against the
+honest disclosure required by ADR-002. It was replaced by drawing West's
+synthetic months as a dashed line, which cannot be misread because it only
+touches West.
+
+A caption on Figure 2 also stated that all four roads peak in the evening.
+West peaks at midday (hour 12), which the script's own printed output
+showed. Corrected.
+
+The general lesson: numeric review items can audit data plots but cannot
+audit explanatory diagrams or caption text. Both need a human read, and
+both are exactly where errors survived here.
+
+A fourth independent signature of the synthetic West segment emerged from
+Figure 6, alongside the three already recorded in ADR-002. West's scatter
+of lag_168 against actual vehicles forms a near-uniform filled rectangle,
+where North forms a tight diagonal cloud. Real traffic does not fill a box
+evenly. This is the most visually obvious of the four signatures.
+
+**Sources**
+None, design decision.

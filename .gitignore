@@ -4,3 +4,4 @@ __pycache__/
 sensor_log.csv
 .claude/
 .vscode/
+models/count_model.joblib

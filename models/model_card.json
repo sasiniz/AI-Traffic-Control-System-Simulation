@@ -1,0 +1,41 @@
+{
+  "training_row_count": 40320,
+  "test_row_count": 17376,
+  "split_date": "2017-01-01",
+  "feature_columns": [
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "is_weekend",
+    "road_East",
+    "road_North",
+    "road_South",
+    "road_West",
+    "lag_168",
+    "roll_mean_24"
+  ],
+  "sklearn_version": "1.9.0",
+  "n_estimators": 300,
+  "random_state": 42,
+  "test_metrics_per_road": {
+    "East": {
+      "MAE": 4.6943,
+      "RMSE": 8.8568
+    },
+    "North": {
+      "MAE": 7.2725,
+      "RMSE": 10.6189
+    },
+    "South": {
+      "MAE": 3.0833,
+      "RMSE": 4.228
+    },
+    "West": {
+      "MAE": 2.034,
+      "RMSE": 2.757
+    }
+  }
+}
