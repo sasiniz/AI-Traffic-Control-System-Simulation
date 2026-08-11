@@ -38,17 +38,30 @@ roughly 6x in mean volume (North ~45/hr, West ~7/hr). Label-encoding them
 0-3 would imply an ordering between roads that does not exist. One-hot
 lets the model learn each road independently.
 
+FEATURE LEGALITY AT SCHEDULE-GENERATION TIME: the schedule is regenerated
+weekly (ADR-012), so a feature is only usable if it can be computed for the
+FURTHEST hour in that week, which is 168 hours after generation. lag_168,
+lag_336 and roll_168_lag168 all satisfy this. An earlier feature set used a
+rolling mean of the previous 24 hours, which needs data that has not
+happened yet at generation time and is therefore illegal. See ADR-015 and
+CLAUDE.md.
+
 lag_168: the Vehicles value at the same hour exactly 168 hours (7 days)
 earlier, per road. Hourly traffic is strongly weekly-periodic, so the same
 hour of the same weekday one week ago is usually the single strongest
 predictor. 168 rather than 24 because a 24-hour lag would compare a Monday
-to a Sunday.
+to a Sunday, and 24 is illegal under the rule above regardless.
 
-roll_mean_24: rolling mean of Vehicles over the previous 24 hours, per
-road, shifted by 1 so the CURRENT row is never included. This captures the
-recent level of demand. The shift is critical - including the current row
-would leak the target into the feature and the model would look excellent
-for a completely false reason.
+lag_336: the Vehicles value 336 hours (14 days) earlier, per road. Confirmed
+by detrended autocorrelation as the next-best legal lag after lag_168.
+Carries a second, independent read on the current level.
+
+roll_168_lag168: the mean of Vehicles over the 168 hours ending 168 hours
+before the target row, per road - s.shift(168).rolling(168).mean(). This is
+the legal replacement for the illegal 24-hour rolling mean described
+above: it captures the recent level of demand using only data that is
+already available 168 hours ahead of any target hour in the scheduling
+week.
 
 DELIBERATELY NO year FEATURE: the dataset only covers 2015, 2016, and half
 of 2017. A tree would use year as a row identifier rather than a
@@ -65,9 +78,11 @@ tree would simply clamp - which means the leak would be invisible rather
 than absent. FEATURE_COLUMNS below therefore states the model inputs
 explicitly rather than leaving Stage 2 to infer them.
 
-Rows with NaN lag_168 or roll_mean_24 (the first week of history per road,
-which cannot have a 7-day lag) are dropped, and the count dropped is
-reported when this file is run, so it can be stated in the methodology.
+Rows with NaN lag_168, lag_336 or roll_168_lag168 (the first two weeks of
+history per road, which cannot yet have a 14-day lag) are dropped, and the
+count dropped is reported when this file is run, so it can be stated in the
+methodology. lag_336 has the widest NaN set of the three and drives the
+drop; see the printed audit for the exact counts.
 
 temporal_split() splits on a fixed date, NOT randomly: hourly traffic is
 autocorrelated, so a random 80/20 split would put 09:00 in training and
@@ -135,8 +150,9 @@ import pandas as pd
 
 DATA_PATH = "data/traffic_final_cleaned.csv"
 SPLIT_DATE = "2017-01-01"
-LAG_HOURS = 168        # 7 days - see module docstring
-ROLL_WINDOW = 24       # hours - see module docstring
+LAG_HOURS = 168         # 7 days - see module docstring
+LAG_HOURS_336 = 336     # 14 days - see module docstring
+ROLL_WINDOW_168 = 168   # hours, ending 168h before target - see module docstring
 
 # 28 days. Chosen so the trailing window always contains four of every
 # weekday, which keeps the quartile estimate stable while still tracking
@@ -159,7 +175,7 @@ FEATURE_COLUMNS = [
     "month_sin", "month_cos",
     "is_weekend",
     "road_East", "road_North", "road_South", "road_West",
-    "lag_168", "roll_mean_24",
+    "lag_168", "lag_336", "roll_168_lag168",
 ]
 TARGET_COLUMN = "Vehicles"
 
@@ -223,9 +239,9 @@ def _trailing_outlier_fence(s, window=TRAILING_WINDOW_HOURS):
 
     shift(1) before the rolling window is what stops the current value
     contributing to the fence that judges it - the same target-leakage
-    argument as roll_mean_24. Rows without a full window return NaN, which
-    the caller turns into False rather than True: an unknown fence is not
-    evidence of an anomaly.
+    argument as the lag/rolling features below. Rows without a full window
+    return NaN, which the caller turns into False rather than True: an
+    unknown fence is not evidence of an anomaly.
     """
     prev = s.shift(1)
     q1 = prev.rolling(window=window).quantile(0.25)
@@ -240,8 +256,9 @@ def load_and_engineer(path=DATA_PATH):
     feature_df is sorted by Road then DateTime, carries the engineered
     features described in the module docstring, and keeps
     Synthetic_Segment_Unverified so Stage 2 can report West separately
-    (see ADR-002). Rows without a full 168-hour lag or 24-hour rolling
-    window are dropped; rows_dropped_for_nan is that count.
+    (see ADR-002). Rows without a full 168-hour lag, 336-hour lag or
+    168-hour rolling window are dropped; rows_dropped_for_nan is that
+    count.
     """
     df = pd.read_csv(path, parse_dates=["DateTime"])
 
@@ -286,16 +303,25 @@ def load_and_engineer(path=DATA_PATH):
 
     # Same hour, same weekday, one week ago - usually the strongest single
     # predictor of hourly traffic. 168h not 24h so it never compares a
-    # weekday to a weekend day. Safe to use a positional shift because
-    # _assert_hourly_series_is_complete has already run.
+    # weekday to a weekend day, and because 24h is illegal at generation
+    # time anyway (see module docstring). Safe to use a positional shift
+    # because _assert_hourly_series_is_complete has already run.
     df["lag_168"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS)
 
-    # Recent demand level. shift(1) BEFORE the rolling window is what
-    # keeps the current row out of its own feature - without it the
-    # target leaks into the feature and the model looks good for a false
-    # reason.
-    df["roll_mean_24"] = df.groupby("Road")["Vehicles"].transform(
-        lambda s: s.shift(1).rolling(window=ROLL_WINDOW).mean()
+    # Same hour, same weekday, two weeks ago. A second, independent read on
+    # the current level, confirmed by detrended autocorrelation as the
+    # next-best legal lag after lag_168. See ADR-015.
+    df["lag_336"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS_336)
+
+    # Mean of the 168 hours ending 168 hours before the target row. This is
+    # the legal replacement for an earlier, illegal 24-hour rolling mean
+    # (which needed the 24 hours immediately before the target - not
+    # available 168 hours ahead of a scheduling week). shift(168) before
+    # the rolling window is
+    # what keeps every value in the window available at generation time.
+    # See ADR-015 and CLAUDE.md's feature legality rule.
+    df["roll_168_lag168"] = df.groupby("Road")["Vehicles"].transform(
+        lambda s: s.shift(LAG_HOURS).rolling(window=ROLL_WINDOW_168).mean()
     )
 
     # Level-relative outlier flag. The CSV's own Outlier_Flag is a Tukey
@@ -312,10 +338,15 @@ def load_and_engineer(path=DATA_PATH):
     df["outlier_trailing"] = (df["Vehicles"] > fence).fillna(False)
 
     before = len(df)
-    # The first LAG_HOURS rows of each road cannot have a 7-day lag yet -
+    # The first two weeks of rows per road cannot have a 336-hour lag yet -
     # drop them and report how many that is, so it can be stated in the
-    # methodology rather than silently absorbed.
-    df = df.dropna(subset=["lag_168", "roll_mean_24"]).reset_index(drop=True)
+    # methodology rather than silently absorbed. All three columns are
+    # dropped on TOGETHER: they have different NaN counts (lag_336 has the
+    # widest), and dropping on only one of them would leave NaN behind in
+    # the others.
+    df = df.dropna(
+        subset=["lag_168", "lag_336", "roll_168_lag168"]
+    ).reset_index(drop=True)
     rows_dropped_for_nan = before - len(df)
 
     return df, rows_dropped_for_nan
@@ -446,11 +477,38 @@ if __name__ == "__main__":
     # --- feature engineering ---------------------------------------------
     print()
     print("=== Feature engineering ===")
+
+    # NaN counts before the drop, printed individually so the drop can be
+    # attributed to the right column(s) rather than reported as one number.
+    _pre = pd.read_csv(DATA_PATH, parse_dates=["DateTime"])
+    _pre = _pre.sort_values(["Road", "DateTime"]).reset_index(drop=True)
+    _pre["lag_168"] = _pre.groupby("Road")["Vehicles"].shift(LAG_HOURS)
+    _pre["lag_336"] = _pre.groupby("Road")["Vehicles"].shift(LAG_HOURS_336)
+    _pre["roll_168_lag168"] = _pre.groupby("Road")["Vehicles"].transform(
+        lambda s: s.shift(LAG_HOURS).rolling(window=ROLL_WINDOW_168).mean()
+    )
+    print("NaN counts before the drop:")
+    print(f"  lag_168:          {int(_pre['lag_168'].isna().sum())}")
+    print(f"  lag_336:          {int(_pre['lag_336'].isna().sum())}")
+    print(f"  roll_168_lag168:  {int(_pre['roll_168_lag168'].isna().sum())}")
+    lag336_nan = set(_pre.index[_pre["lag_336"].isna()])
+    lag168_nan = set(_pre.index[_pre["lag_168"].isna()])
+    roll_nan = set(_pre.index[_pre["roll_168_lag168"].isna()])
+    print(f"  lag_168 NaN set subset of lag_336 NaN set: "
+          f"{lag168_nan.issubset(lag336_nan)}")
+    print(f"  roll_168_lag168 NaN set subset of lag_336 NaN set: "
+          f"{roll_nan.issubset(lag336_nan)}")
+
     features, rows_dropped_for_nan = load_and_engineer(DATA_PATH)
     print("Integrity guards passed: flag columns are bool, hourly series is "
           "gap free and has no duplicate timestamps.")
-    print(f"Rows dropped for NaN lag_168 or roll_mean_24: {rows_dropped_for_nan}")
+    print(f"Rows dropped for NaN lag_168, lag_336 or roll_168_lag168: "
+          f"{rows_dropped_for_nan}")
     print(f"Final row count: {len(features)}")
+    print("Final row count per road:")
+    print(features.groupby("Road").size().to_string())
+    print("First retained DateTime per road:")
+    print(features.groupby("Road")["DateTime"].min().to_string())
     print(f"Columns ({len(features.columns)}): {list(features.columns)}")
 
     # --- feature matrix ---------------------------------------------------
@@ -458,9 +516,12 @@ if __name__ == "__main__":
     print("=== Feature matrix ===")
     X, y = feature_matrix(features)
     print(f"X shape: {X.shape}   y shape: {y.shape}")
+    print(f"len(FEATURE_COLUMNS): {len(FEATURE_COLUMNS)}")
+    print(f"FEATURE_COLUMNS: {FEATURE_COLUMNS}")
     print(f"X columns match FEATURE_COLUMNS in order: "
           f"{list(X.columns) == FEATURE_COLUMNS}")
     print(f"X columns ({len(X.columns)}): {list(X.columns)}")
+    print(f"NaN count in X: {int(X.isna().sum().sum())}")
     excluded = [c for c in features.columns if c not in FEATURE_COLUMNS]
     print(f"Deliberately excluded from X: {excluded}")
 
@@ -469,6 +530,10 @@ if __name__ == "__main__":
     print("=== Temporal split ===")
     print(f"Train rows: {len(train)}")
     print(f"Test rows: {len(test)}")
+    print("Train rows per road:")
+    print(train.groupby("Road").size().to_string())
+    print("Test rows per road:")
+    print(test.groupby("Road").size().to_string())
 
     print("Mean Vehicles per road, train:")
     print(train.groupby("Road")["Vehicles"].mean().round(2).to_string())
