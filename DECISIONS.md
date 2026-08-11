@@ -1010,3 +1010,127 @@ evenly. This is the most visually obvious of the four signatures.
 
 **Sources**
 None, design decision.
+
+---
+
+## ADR-018: ADR-015 applied, and the train-side figures it changed
+
+**Date:** 2026-08-11
+**Status:** Accepted
+**Records the application of ADR-015 and amends measured figures in
+ADR-008, ADR-009, ADR-010 and ADR-013. Does not change any decision.
+The test-side figures in ADR-011 and ADR-014 are unaffected and stand.**
+
+**Context**
+ADR-015 decided the feature set correction. It did not apply it.
+data_prep.py was corrected on 2026-08-11 and committed as ac695a1.
+
+Applying it changed more than the feature list. lag_336 needs 336 hours of
+history where lag_168 needed 168, so the warm-up drop doubled. Every
+figure previously measured on the train side of the split was computed on
+168 more rows per road than the script now produces. Those figures are
+recorded across four earlier entries. Leaving them unamended would mean a
+reader running data_prep.py sees six numbers that do not match the log.
+
+**Decision**
+Record the application, and amend the affected figures here rather than
+editing the earlier entries, which are append only.
+
+Pipeline figures, before and after:
+
+    Rows dropped for NaN            672        1344
+    Final row count               57696       57024
+    Final rows per road           14424       14256
+    First retained hour      2015-11-08  2015-11-15
+    Train rows                    40320       39648
+    Test rows                     17376       17376
+
+Amended figures, by the entry that recorded them:
+
+    ADR-008, train mean Vehicles
+        North   36.92 -> 37.20
+        South   11.31 -> 11.36
+        East    12.17 -> 12.29
+        West     7.27 -> 7.27 (unchanged)
+    ADR-009, West Outlier_Flag total       131 -> 128
+    ADR-009, agreement rate, South        94.2 -> 94.1
+    ADR-009, agreement rate, West         99.4 -> 99.5
+    ADR-009, rows with no trailing window 2016 -> 1344
+    ADR-010, outlier filter removes from train
+                                    347 (0.86%) -> 344 (0.87%)
+    ADR-013, training set size           40320 -> 39648
+
+Only West's Outlier_Flag total moved among the four roads. The 168 rows
+dropped per road cover 2015-11-08 to 2015-11-14, and only West had flagged
+hours in that week.
+
+The trailing-window figure follows arithmetically: the fence needs 672
+hours of warm-up per road, so 2688 rows never have one, and the drop now
+removes 1344 of them instead of 672.
+
+**Alternatives rejected**
+Editing the six figures in place in ADR-008, ADR-009, ADR-010 and ADR-013.
+Rejected because the log is append only, and because the earlier figures
+are correct records of what the earlier code produced. The change is in
+the code, not in the measurement.
+Leaving the figures unamended on the grounds that none of them alters a
+decision. Rejected because a reader running the script and finding six
+mismatches has no way to tell whether they are stale records or a broken
+pipeline.
+
+**Consequences**
+Verification. The corrected features were checked by a leakage test rather
+than by inspection: the three lag features were recomputed for North at
+2016-06-01 08:00 from a series blanked after 2016-05-25 08:00, and all
+three returned values identical to a hand computation from the raw CSV
+(lag_168 31, lag_336 25, roll_168_lag168 35.636905, being the mean of the
+168 hours from 2016-05-18 09:00 to 2016-05-25 08:00). Because shift is
+positional, any feature reaching into the blanked region would have
+returned NaN. This is the check that makes the legality claim in ADR-015
+testable rather than asserted.
+
+Test comparability. The test set is unchanged at 17376 rows, 4344 per
+road, because the warm-up drop falls entirely inside the training period.
+Test metrics measured after the Stage 2 re-run are therefore directly
+comparable to those in ADR-011 and ADR-014.
+
+The ADR-015 validation table was produced by standalone sweeps rather than
+by data_prep.py, so whether those sweeps applied the same 336-hour warm-up
+drop is not recorded. The comparison between feature sets in that table is
+internally consistent, but its absolute MAE values should not be assumed
+to match what the corrected pipeline will produce. Treat the ordering as
+the finding, not the numbers.
+
+Three code debts introduced or exposed by this change, none affecting
+correctness today:
+The __main__ block recomputes lag_168, lag_336 and roll_168_lag168 outside
+load_and_engineer in order to print the per-column NaN counts. The two
+copies agree now. If load_and_engineer changes and that block does not,
+the printed audit will report on logic the pipeline no longer uses, which
+is worse than no audit because it looks like evidence.
+LAG_HOURS, LAG_HOURS_336 and ROLL_WINDOW_168 are constants, but the column
+names lag_168, lag_336 and roll_168_lag168 are hardcoded strings. Changing
+a constant would make a column name false without raising anything.
+Pre-existing, unrelated to this change: in the outlier_trailing
+computation, .fillna(False) never fires, because comparing a value against
+NaN already returns False. The stated intent is achieved by comparison
+semantics rather than by that line.
+
+Figure 8 in figures/ is now factually wrong. It labels the 24-hour rolling
+mean as currently being in data_prep.py, which ac695a1 made false. ADR-017
+anticipated this. The figures must be regenerated before the report cites
+them.
+
+One traceability loss. The correction task required that the superseded
+feature name appear nowhere in data_prep.py, which was intended to catch
+leftover code but also removed it from the explanatory docstring. The file
+now describes the illegal feature without naming it, so a reader must come
+to ADR-015 to learn what was replaced. Accepted rather than reverted,
+because the docstring already cites ADR-015 by number.
+
+Stage 2 must be re-run in full. models/model_card.json and every metric in
+it are superseded, as ADR-015 already stated.
+
+**Sources**
+None, measurement record. All figures produced on 2026-08-11 by
+data_prep.py at commit ac695a1.
