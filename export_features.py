@@ -23,6 +23,20 @@ from data_prep import DATA_PATH, load_and_engineer, temporal_split
 
 OUTPUT_PATH = "data/feature_table.csv"
 
+# ADR-019: the full feature table is gitignored (reproducible from committed
+# code + committed data), so this sample is committed in its place - a
+# contiguous slice a marker can open without cloning the repo and running
+# the pipeline.
+SAMPLE_OUTPUT_PATH = "data/feature_table_sample.csv"
+SAMPLE_START = pd.Timestamp("2016-12-19 00:00")
+SAMPLE_END = pd.Timestamp("2017-01-08 23:00")  # inclusive
+# Three contiguous weeks (504h), not two, is the minimum window here.
+# lag_336 reaches 336 hours back, so a row near the end of the sample can
+# only be checked against a same-sample row if the sample carries at least
+# 336 hours before it; two weeks (336h) would leave no margin at all. The
+# window is also positioned to straddle 2017-01-01 so both split values
+# ("train" and "test") appear in the sample.
+
 
 def main():
     features, rows_dropped = load_and_engineer(DATA_PATH)
@@ -53,10 +67,31 @@ def main():
     print()
     print('First 3 rows for Road == "North", DateTime >= 2016-01-08 '
           '(far enough in that lag_168 is populated):')
-    sample = combined[
+    preview = combined[
         (combined["Road"] == "North") & (combined["DateTime"] >= "2016-01-08")
     ].head(3)
-    print(sample.to_string())
+    print(preview.to_string())
+
+    # --- feature_table_sample.csv (ADR-019) -------------------------------
+    sample = combined[
+        (combined["DateTime"] >= SAMPLE_START) & (combined["DateTime"] <= SAMPLE_END)
+    ].copy()
+    sample = sample.sort_values(["Road", "DateTime"]).reset_index(drop=True)
+    sample.to_csv(SAMPLE_OUTPUT_PATH, index=False)
+
+    sample_size_kb = os.path.getsize(SAMPLE_OUTPUT_PATH) / 1024
+
+    print()
+    print(f"=== {SAMPLE_OUTPUT_PATH} (ADR-019 sample) ===")
+    print(f"Window: {SAMPLE_START} to {SAMPLE_END} inclusive")
+    print(f"Row count: {len(sample)}")
+    print("Rows per road:")
+    print(sample.groupby("Road").size().to_string())
+    print(f"Column count: {len(sample.columns)} "
+          f"(full table: {len(combined.columns)}; match: "
+          f"{len(sample.columns) == len(combined.columns)})")
+    print(f"split value counts: {sample['split'].value_counts().to_dict()}")
+    print(f"File size: {sample_size_kb:.1f} KB")
 
 
 if __name__ == "__main__":

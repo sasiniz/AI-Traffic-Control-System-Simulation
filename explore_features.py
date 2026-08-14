@@ -29,7 +29,7 @@ thing it evidences cannot catch a bug in it: if both files computed
 roll_168_lag168 the same wrong way, these figures would faithfully
 reproduce data_prep.py's bug rather than reveal it. Keeping a second,
 independent implementation is what makes an agreement check between the two
-meaningful rather than circular (see the cross-check in __main__).
+meaningful rather than circular.
 
 One exception: FEATURE_COLUMNS itself is imported below, but only to print
 its length in Figure 8's caption. It is a list of column names, not a

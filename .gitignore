@@ -5,3 +5,4 @@ sensor_log.csv
 .claude/
 .vscode/
 models/count_model.joblib
+data/feature_table.csv

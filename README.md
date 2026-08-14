@@ -118,6 +118,24 @@ sensor_log.csv       # generated on exit - sensor snapshots for later ML work
 claude.md            # working notes / conventions for AI-assisted development
 ```
 
+## Feature table sample
+
+`data/feature_table.csv` (the full Stage 1 feature frame, written by
+`export_features.py`) is reproducible from committed code and committed data,
+so it is gitignored rather than tracked. `data/feature_table_sample.csv` is
+committed in its place: a contiguous three-week slice, 2016-12-19 00:00 to
+2017-01-08 23:00 inclusive (504 hours per road), straddling the train/test
+split so both `split` values appear. It lets a reader check individual rows
+by eye without cloning the repo and running the pipeline. See ADR-019 in
+`DECISIONS.md`.
+
+Limitation: `outlier_trailing` cannot be verified inside the sample, because
+that flag uses a 672-hour trailing window (ADR-009), which is wider than the
+504-hour sample. The three lag features (`lag_168`, `lag_336`,
+`roll_168_lag168`) CAN be verified within it - three weeks is the minimum
+window that lets `lag_336`, which reaches 336 hours back, be checked against
+a row that is itself present in the sample.
+
 ## Known limitations
 
 - Turning is **visual only**: vehicles gap-keep along their own path and
