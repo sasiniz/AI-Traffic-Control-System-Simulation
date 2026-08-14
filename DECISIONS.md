@@ -1134,3 +1134,97 @@ it are superseded, as ADR-015 already stated.
 **Sources**
 None, measurement record. All figures produced on 2026-08-11 by
 data_prep.py at commit ac695a1.
+
+---
+
+## ADR-019: explore_features.py stays independent; feature_table.csv is sampled
+
+**Date:** 2026-08-14
+**Status:** Accepted
+**Two decisions taken together because both concern how the exploratory
+artefacts relate to the pipeline. Neither changes the model or the feature
+set. ADR-013 established the reproducible-artefact reasoning this entry
+applies to a second file.**
+
+**Context**
+
+Both questions became live once ADR-015 was applied.
+
+First, explore_features.py computes lag_168, lag_336 and roll_168_lag168
+itself rather than importing them from data_prep.py. Its docstring gave the
+reason: it needed to examine candidate features data_prep.py had not adopted
+yet. That reason expired when ADR-015 adopted them. The obvious move is to
+delete the duplicate and import, and this is the same class of duplication
+removed from data_prep.py's __main__ block in the preceding commit.
+
+Second, data/feature_table.csv is tracked at roughly 11.5 MB. It is fully
+reproducible from committed code and committed input data. Every feature set
+change writes another full copy into git history permanently. This is the
+argument ADR-013 used to gitignore models/count_model.joblib, and the same
+argument that forced a git commit --amend when that file was committed by
+accident.
+
+**Decision**
+
+Keep explore_features.py independent. Replace the expired rationale in its
+docstring with the correct one: the figures are evidence, and evidence that
+shares a code path with the thing it evidences cannot contradict it. If both
+files imported the same shift, a wrong shift would draw a normal-looking
+Figure 6 and the figure would confirm the bug rather than expose it. Add a
+cross-check that prints both files' values for the same row and requires
+agreement, so drift is caught the moment it appears.
+
+Gitignore the full data/feature_table.csv. Commit a sample in its place, at
+data/feature_table_sample.csv.
+
+Sample window, measured on 2026-08-14:
+
+    2016-12-19 00:00 to 2017-01-08 23:00
+    504 hours per road, 2016 rows total, 23 columns
+    train 1248 rows, test 768 rows
+    approximately 450 KB
+
+Three contiguous weeks is a minimum, not a round number. lag_336 reaches back
+336 hours, so a row in the final week can only be checked against a row that
+is present if the sample carries at least 336 hours before it. Two weeks
+would make lag_336 uncheckable inside the sample, which defeats the point of
+committing one. The window is positioned to straddle 2017-01-01 so both
+values of the split column appear.
+
+**Alternatives rejected**
+
+Importing the features from data_prep.py. Rejected on the reasoning above.
+Accepted cost: two implementations that can drift. The cross-check is what
+makes that cost tolerable rather than what removes it.
+
+Tracking the full feature_table.csv. Rejected on repository growth. Unlike
+the model artefact, its size is not prohibitive, but the reproducibility
+argument is identical and nothing is lost that a sample does not provide.
+
+Gitignoring it with no sample at all. Rejected. A marker who wants to check
+the feature engineering by eye should not have to clone the repository,
+build the environment and run a script to do it.
+
+**Consequences**
+
+The independence is now a stated design property rather than an accident of
+history, so a future contributor who sees the duplication has the reason in
+front of them.
+
+The sample cannot verify outlier_trailing. That flag uses a 672-hour
+trailing window (ADR-009), so no row inside a 504-hour sample has a complete
+window within the sample. The three lag features are verifiable; the outlier
+flag is not. This limitation must be stated in the sample file's header
+comment or in the README, not left for a reader to discover.
+
+The full file must be removed from tracking with git rm --cached rather than
+deleted, and it stays on disk for local inspection.
+
+Existing history still contains the pre-ADR-015 copy of the full file at
+57696 rows. That copy is stale and describes the illegal feature set. It is
+not rewritten, because rewriting published history is worse than carrying a
+superseded artefact, but it should not be cited.
+
+**Sources**
+None, design decision. Sample window figures measured on
+data/traffic_final_cleaned.csv on 2026-08-14.
