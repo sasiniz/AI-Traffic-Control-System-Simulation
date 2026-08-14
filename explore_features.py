@@ -9,23 +9,32 @@ for a report that has to justify each feature with evidence. This file
 produces that evidence as figures and printed numbers, so each feature in
 the methodology chapter can point at a figure instead of an assertion.
 
-It is a verification step, not a formality: it can show a feature choice
-was wrong. One already has - see Figure 8. roll_mean_24 (the mean of the
-24 hours immediately before the predicted hour) needs data that does not
-exist when a week of green-time schedules is generated in advance, in one
-batch, before that week has happened. It is illegal for a generation-time
+It is a verification step, not a formality: it already showed a feature
+choice was wrong - see Figure 8. roll_mean_24 (the mean of the 24 hours
+immediately before the predicted hour) needs data that does not exist when
+a week of green-time schedules is generated in advance, in one batch,
+before that week has happened. It was illegal for a generation-time
 feature set even though it is a perfectly good feature for same-day
-forecasting. Correcting data_prep.py for this is a separate task; this
-file's job is only to produce the evidence.
+forecasting. data_prep.py has since been corrected (ADR-015): it now uses
+lag_168, lag_336 and roll_168_lag168, and no longer uses roll_mean_24.
+Figure 8 records the reasoning that correction was based on.
 
 WHY THIS FILE DOES NOT IMPORT FROM data_prep.py
 --------------------------------------------------
-Figures 6 and 8 examine candidate features - lag_336, roll_168_lag168 -
-that do not exist in data_prep.py's FEATURE_COLUMNS. This file reads
-data/traffic_final_cleaned.csv directly and computes everything itself,
-independently of data_prep.py, so it can examine features data_prep.py
-has not adopted yet without needing to modify it (which this task
-explicitly forbids).
+This file reads data/traffic_final_cleaned.csv directly and computes every
+lag and rolling feature itself, independently of data_prep.py, rather than
+calling its engineering functions. The figures exist to be evidence for the
+feature choices in a report, and evidence that shares a code path with the
+thing it evidences cannot catch a bug in it: if both files computed
+roll_168_lag168 the same wrong way, these figures would faithfully
+reproduce data_prep.py's bug rather than reveal it. Keeping a second,
+independent implementation is what makes an agreement check between the two
+meaningful rather than circular (see the cross-check in __main__).
+
+One exception: FEATURE_COLUMNS itself is imported below, but only to print
+its length in Figure 8's caption. It is a list of column names, not a
+computation, so reading it does not create the shared-code-path problem
+above.
 
 A NOTE ON WHAT AN AUTOMATED REVIEW CAN AND CANNOT CHECK
 ----------------------------------------------------------
@@ -50,6 +59,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from data_prep import FEATURE_COLUMNS
+
 DATA_PATH = "data/traffic_final_cleaned.csv"
 FIG_DIR = "figures"
 DPI = 150
@@ -63,6 +74,7 @@ TREND_WINDOW = 672  # 28 days - matches TRAILING_WINDOW_HOURS in data_prep.py
 
 # Candidate lag features examined in Figure 8. Defined here as constants so
 # the diagram cannot drift out of step with the definitions again.
+LAG_24 = 24                      # same hour, 1 day earlier
 LAG_168 = 168                    # same hour, 1 week earlier
 LAG_336 = 336                    # same hour, 2 weeks earlier
 ROLL_WINDOW_LEGAL = 168          # width of the legal rolling mean
@@ -432,30 +444,46 @@ def fig8_feature_legality():
     eye after any change.
 
     Generation happens at t=0; a week of schedules (t=0 to t=168) is
-    produced in one batch before any of it has happened. A target hour
-    late in that week (t=160) can only legally use data that already
-    existed at t=0, i.e. data from t<=0.
+    produced in one batch before any of it has happened. The target hour is
+    placed at t=168, the LAST hour of that week - the binding case, where
+    every legal feature has the least room to spare. It can only legally
+    use data that already existed at t=0, i.e. data from t<=0.
 
     ILLEGAL, all reach into the week being scheduled:
-        lag_1         -> t=159
-        lag_24        -> t=136
-        roll_mean_24  -> window [t-24, t-1] = [136, 159]
+        lag_1         -> t=167   (never adopted - illustrative only)
+        lag_24        -> t=144   (never adopted - illustrative only)
+        roll_mean_24  -> window [t-24, t-1] = [144, 167]
+                         (WAS in data_prep.py; REJECTED and replaced by
+                         ADR-015 once this figure's reasoning identified
+                         it as illegal)
 
-    LEGAL, all resolve to t<=0:
-        lag_168          -> t=-8
-        lag_336          -> t=-176
+    LEGAL, all resolve to t<=0 - this is the set data_prep.py uses now:
+        lag_168          -> t=0    (lands exactly on generation time - the
+                                    worst legal case, with zero hours to
+                                    spare)
+        lag_336          -> t=-168
         roll_168_lag168  -> a 168-HOUR mean ending 168h before the target,
-                            i.e. window [t-335, t-168] = [-175, -8]
+                            i.e. window [t-335, t-168] = [-167, 0]. At this
+                            worst case it uses every one of the 168 hours
+                            available before generation time, and not one
+                            more.
 
     Note the width of roll_168_lag168: 168 hours, not 24. An earlier
     version of this file drew it as a 24-hour bracket, and every automated
     review item still passed, because a schematic has no numbers to check.
     The constants at the top of this module now drive the arithmetic so the
     drawing cannot drift from the definition again.
+
+    All lane positions below are computed as offsets from `target`, not
+    hardcoded, so moving the target (or changing LAG_168/LAG_336/the roll
+    constants) keeps the geometry self-consistent.
     """
     print()
     print("=== Figure 8: feature legality at schedule-generation time ===")
-    target = 160  # a target hour late in the scheduled week
+    # t=168, the last hour of the scheduled week (ADR-015's furthest-hour
+    # rule) - not t=160. At t=160 every legal feature clears the generation
+    # line with room to spare; only the last hour is the binding case.
+    target = LAG_168
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.axhline(0, color="black", linewidth=1)
@@ -467,7 +495,7 @@ def fig8_feature_legality():
             fontsize=9, color="tab:blue")
 
     ax.scatter([target], [0], color="black", zorder=5)
-    ax.annotate("target hour (late in the week)", (target, 0),
+    ax.annotate("target hour (last hour of the scheduled week)", (target, 0),
                 textcoords="offset points", xytext=(-6, 8), ha="right", fontsize=8)
 
     # Lane positions. Generous spacing so multi-line labels never overlap
@@ -476,7 +504,7 @@ def fig8_feature_legality():
     LANE = 0.34
     TEXT_GAP = 0.09
 
-    illegal_points = [("lag_1", target - 1), ("lag_24", target - LAG_168 // 7)]
+    illegal_points = [("lag_1", target - 1), ("lag_24", target - LAG_24)]
     legal_points = [("lag_168", target - LAG_168), ("lag_336", target - LAG_336)]
 
     y = -LANE
@@ -489,7 +517,10 @@ def fig8_feature_legality():
 
     # roll_mean_24: a WINDOW, not a point. Ends ROLL_SHIFT_ILLEGAL hours
     # before the target and is ROLL_WINDOW_ILLEGAL hours wide, so it sits
-    # entirely inside the scheduled week. ILLEGAL.
+    # entirely inside the scheduled week. ILLEGAL - and unlike lag_1/lag_24
+    # above, this one was actually in data_prep.py until ADR-015 replaced
+    # it with roll_168_lag168, so the label says REJECTED rather than just
+    # ILLEGAL to mark that history.
     ill_end = target - ROLL_SHIFT_ILLEGAL
     ill_start = ill_end - ROLL_WINDOW_ILLEGAL + 1
     ax.plot([ill_start, ill_end], [y, y], color="firebrick", linewidth=3,
@@ -497,20 +528,21 @@ def fig8_feature_legality():
     ax.plot([ill_start, ill_start], [y - 0.05, y + 0.05], color="firebrick", linewidth=1.5)
     ax.plot([ill_end, ill_end], [y - 0.05, y + 0.05], color="firebrick", linewidth=1.5)
     ax.text(ill_start - 6, y - TEXT_GAP,
-            f"roll_mean_24  ({ROLL_WINDOW_ILLEGAL}h window)  ILLEGAL",
+            f"roll_mean_24  ({ROLL_WINDOW_ILLEGAL}h window)  ILLEGAL - REJECTED",
             ha="right", va="top", fontsize=8.5, color="firebrick")
 
     y = LANE
     for name, x in legal_points:
         ax.annotate("", xy=(x, y), xytext=(target, y),
                     arrowprops=dict(arrowstyle="->", color="seagreen", linewidth=1.5))
-        ax.text(x - 6, y + TEXT_GAP, f"{name}  LEGAL", ha="right", va="bottom",
+        ax.text(x - 6, y + TEXT_GAP, f"{name}  LEGAL - ADOPTED", ha="right", va="bottom",
                 fontsize=8.5, color="seagreen")
         y += LANE
 
     # roll_168_lag168: a 168-HOUR mean ending ROLL_SHIFT_LEGAL hours before
     # the target, so window [target-335, target-168]. Entirely at or before
-    # generation time. LEGAL.
+    # generation time. LEGAL, and - together with lag_168 and lag_336 above -
+    # the feature data_prep.py adopted in its place (ADR-015).
     leg_end = target - ROLL_SHIFT_LEGAL
     leg_start = leg_end - ROLL_WINDOW_LEGAL + 1
     ax.plot([leg_start, leg_end], [y, y], color="seagreen", linewidth=3,
@@ -518,24 +550,37 @@ def fig8_feature_legality():
     ax.plot([leg_start, leg_start], [y - 0.05, y + 0.05], color="seagreen", linewidth=1.5)
     ax.plot([leg_end, leg_end], [y - 0.05, y + 0.05], color="seagreen", linewidth=1.5)
     ax.text(leg_start - 6, y + TEXT_GAP,
-            f"roll_168_lag168  ({ROLL_WINDOW_LEGAL}h window)  LEGAL",
+            f"roll_168_lag168  ({ROLL_WINDOW_LEGAL}h window)  LEGAL - ADOPTED\n"
+            "at this worst case, uses every hour available - not one more",
             ha="right", va="bottom", fontsize=8.5, color="seagreen")
 
-    ax.set_xlim(-560, 200)
+    # Cropped from -560: nothing is drawn left of lag_336 at -168, so -560
+    # was mostly empty margin. -400 keeps the informative region larger on
+    # the page without clipping any drawn element.
+    ax.set_xlim(-400, 200)
     ax.set_ylim(-1.45, 1.45)
     ax.set_yticks([])
     ax.set_xlabel("Hours relative to generation time (t=0)")
-    ax.set_ylabel("(schematic - lanes group legal vs illegal only)")
+    ax.set_ylabel("schematic only: vertical position carries no meaning\n"
+                   "beyond legal above, illegal below", fontsize=8.5)
     ax.set_title("Which candidate features are legal at schedule-generation time")
     caption(fig, "lag_1, lag_24 and roll_mean_24 all reach into the week being "
                   "scheduled, which has not happened yet at generation time - "
                   "illegal. lag_168, lag_336 and roll_168_lag168 only reach into "
-                  "the past relative to generation time - legal. This is why "
-                  "roll_mean_24, currently in data_prep.py, needs correcting.")
+                  "the past relative to generation time - legal, and are three "
+                  f"of the {len(FEATURE_COLUMNS)} features data_prep.py uses "
+                  "(the other eleven are hour_sin/cos, dow_sin/cos, "
+                  "month_sin/cos, is_weekend and the four road one-hots). "
+                  "roll_168_lag168's window ends exactly on the lag_168 hour, "
+                  "so the two are not independent - Stage 2 permutation "
+                  "importance splits credit between them (ADR-018). "
+                  f"roll_mean_24 (a {ROLL_WINDOW_ILLEGAL}-hour window) was in "
+                  "data_prep.py until this illegality was identified; it has "
+                  "since been replaced by roll_168_lag168.")
     save(fig, "fig8_feature_legality.png", rows_used=0,
          note=f"illustrative diagram, not real data rows; "
-              f"legal window drawn as [{leg_start}, {leg_end}] "
-              f"({ROLL_WINDOW_LEGAL}h), illegal window as "
+              f"legal/adopted window drawn as [{leg_start}, {leg_end}] "
+              f"({ROLL_WINDOW_LEGAL}h), illegal/rejected window as "
               f"[{ill_start}, {ill_end}] ({ROLL_WINDOW_ILLEGAL}h)")
 
 
