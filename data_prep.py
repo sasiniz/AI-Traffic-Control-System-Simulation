@@ -249,16 +249,14 @@ def _trailing_outlier_fence(s, window=TRAILING_WINDOW_HOURS):
     return q3 + 1.5 * (q3 - q1)
 
 
-def load_and_engineer(path=DATA_PATH):
+def load_and_sort(path=DATA_PATH):
     """
-    Load the raw CSV and return (feature_df, rows_dropped_for_nan).
+    Read the CSV, run both integrity guards, and return it sorted by Road
+    then DateTime.
 
-    feature_df is sorted by Road then DateTime, carries the engineered
-    features described in the module docstring, and keeps
-    Synthetic_Segment_Unverified so Stage 2 can report West separately
-    (see ADR-002). Rows without a full 168-hour lag, 336-hour lag or
-    168-hour rolling window are dropped; rows_dropped_for_nan is that
-    count.
+    Shared by load_and_engineer and the __main__ audit block, so there is
+    one place that reads the CSV and checks it, not two that could drift
+    apart. See ADR-018's code debt note.
     """
     df = pd.read_csv(path, parse_dates=["DateTime"])
 
@@ -273,6 +271,81 @@ def load_and_engineer(path=DATA_PATH):
     # Guard 2: shift() counts rows, so the series must be gap free. Checked
     # after the sort and BEFORE any lag or rolling computation.
     _assert_hourly_series_is_complete(df)
+
+    return df
+
+
+def add_lag_features(df):
+    """
+    Add lag_168, lag_336 and roll_168_lag168 to df (per road, time ordered)
+    and return it.
+
+    Shared by load_and_engineer and the __main__ audit block, so the NaN
+    counts printed at run time describe the same computation the pipeline
+    actually uses. See ADR-018's code debt note: before this extraction the
+    __main__ block recomputed these three columns itself, and the two
+    copies could silently drift apart.
+
+    Same hour, same weekday, one week ago - usually the strongest single
+    predictor of hourly traffic. 168h not 24h so it never compares a
+    weekday to a weekend day, and because 24h is illegal at generation time
+    anyway (see module docstring). Safe to use a positional shift only if
+    the caller already ran load_and_sort, which guarantees a gap free,
+    sorted series.
+    """
+    df["lag_168"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS)
+
+    # Same hour, same weekday, two weeks ago. A second, independent read on
+    # the current level, confirmed by detrended autocorrelation as the
+    # next-best legal lag after lag_168. See ADR-015.
+    df["lag_336"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS_336)
+
+    # Mean of the 168 hours ending 168 hours before the target row. This is
+    # the legal replacement for an earlier, illegal 24-hour rolling mean
+    # (which needed the 24 hours immediately before the target - not
+    # available 168 hours ahead of a scheduling week). Built by rolling
+    # over lag_168 itself rather than re-shifting Vehicles: lag_168 IS
+    # Vehicles shifted 168 hours, per road, so lag_168.rolling(168).mean()
+    # is exactly Vehicles.shift(168).rolling(168).mean() with one less
+    # redundant shift. See ADR-015 and CLAUDE.md's feature legality rule.
+    df["roll_168_lag168"] = df.groupby("Road")["lag_168"].transform(
+        lambda s: s.rolling(window=ROLL_WINDOW_168).mean()
+    )
+
+    return df
+
+
+def lag_nan_report(df):
+    """
+    Given a frame that already carries lag_168, lag_336 and roll_168_lag168,
+    return a dict of the three NaN counts plus the two subset checks printed
+    by the __main__ audit: whether lag_168's and roll_168_lag168's NaN rows
+    are each a subset of lag_336's wider NaN set.
+    """
+    lag168_nan = set(df.index[df["lag_168"].isna()])
+    lag336_nan = set(df.index[df["lag_336"].isna()])
+    roll_nan = set(df.index[df["roll_168_lag168"].isna()])
+    return {
+        "lag_168": len(lag168_nan),
+        "lag_336": len(lag336_nan),
+        "roll_168_lag168": len(roll_nan),
+        "lag_168_subset_of_lag_336": lag168_nan.issubset(lag336_nan),
+        "roll_168_lag168_subset_of_lag_336": roll_nan.issubset(lag336_nan),
+    }
+
+
+def load_and_engineer(path=DATA_PATH):
+    """
+    Load the raw CSV and return (feature_df, rows_dropped_for_nan).
+
+    feature_df is sorted by Road then DateTime, carries the engineered
+    features described in the module docstring, and keeps
+    Synthetic_Segment_Unverified so Stage 2 can report West separately
+    (see ADR-002). Rows without a full 168-hour lag, 336-hour lag or
+    168-hour rolling window are dropped; rows_dropped_for_nan is that
+    count.
+    """
+    df = load_and_sort(path)
 
     hour = df["DateTime"].dt.hour                  # 0-23
     dow = df["DateTime"].dt.dayofweek               # Monday=0 .. Sunday=6
@@ -301,28 +374,10 @@ def load_and_engineer(path=DATA_PATH):
     # individual rows rather than learn a generalisable pattern. See the
     # module docstring and FEATURE_COLUMNS.
 
-    # Same hour, same weekday, one week ago - usually the strongest single
-    # predictor of hourly traffic. 168h not 24h so it never compares a
-    # weekday to a weekend day, and because 24h is illegal at generation
-    # time anyway (see module docstring). Safe to use a positional shift
-    # because _assert_hourly_series_is_complete has already run.
-    df["lag_168"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS)
-
-    # Same hour, same weekday, two weeks ago. A second, independent read on
-    # the current level, confirmed by detrended autocorrelation as the
-    # next-best legal lag after lag_168. See ADR-015.
-    df["lag_336"] = df.groupby("Road")["Vehicles"].shift(LAG_HOURS_336)
-
-    # Mean of the 168 hours ending 168 hours before the target row. This is
-    # the legal replacement for an earlier, illegal 24-hour rolling mean
-    # (which needed the 24 hours immediately before the target - not
-    # available 168 hours ahead of a scheduling week). shift(168) before
-    # the rolling window is
-    # what keeps every value in the window available at generation time.
-    # See ADR-015 and CLAUDE.md's feature legality rule.
-    df["roll_168_lag168"] = df.groupby("Road")["Vehicles"].transform(
-        lambda s: s.shift(LAG_HOURS).rolling(window=ROLL_WINDOW_168).mean()
-    )
+    # lag_168, lag_336 and roll_168_lag168 - see add_lag_features and the
+    # module docstring for why each exists and why each is legal at
+    # schedule-generation time.
+    df = add_lag_features(df)
 
     # Level-relative outlier flag. The CSV's own Outlier_Flag is a Tukey
     # fence computed ONCE over the whole 20 month period, so as demand grew
@@ -480,24 +535,19 @@ if __name__ == "__main__":
 
     # NaN counts before the drop, printed individually so the drop can be
     # attributed to the right column(s) rather than reported as one number.
-    _pre = pd.read_csv(DATA_PATH, parse_dates=["DateTime"])
-    _pre = _pre.sort_values(["Road", "DateTime"]).reset_index(drop=True)
-    _pre["lag_168"] = _pre.groupby("Road")["Vehicles"].shift(LAG_HOURS)
-    _pre["lag_336"] = _pre.groupby("Road")["Vehicles"].shift(LAG_HOURS_336)
-    _pre["roll_168_lag168"] = _pre.groupby("Road")["Vehicles"].transform(
-        lambda s: s.shift(LAG_HOURS).rolling(window=ROLL_WINDOW_168).mean()
-    )
+    # Uses the same load_and_sort + add_lag_features that load_and_engineer
+    # itself calls, so this audit describes the logic the pipeline actually
+    # runs rather than a second copy of it. See ADR-018's code debt note.
+    _pre = add_lag_features(load_and_sort(DATA_PATH))
+    _report = lag_nan_report(_pre)
     print("NaN counts before the drop:")
-    print(f"  lag_168:          {int(_pre['lag_168'].isna().sum())}")
-    print(f"  lag_336:          {int(_pre['lag_336'].isna().sum())}")
-    print(f"  roll_168_lag168:  {int(_pre['roll_168_lag168'].isna().sum())}")
-    lag336_nan = set(_pre.index[_pre["lag_336"].isna()])
-    lag168_nan = set(_pre.index[_pre["lag_168"].isna()])
-    roll_nan = set(_pre.index[_pre["roll_168_lag168"].isna()])
+    print(f"  lag_168:          {_report['lag_168']}")
+    print(f"  lag_336:          {_report['lag_336']}")
+    print(f"  roll_168_lag168:  {_report['roll_168_lag168']}")
     print(f"  lag_168 NaN set subset of lag_336 NaN set: "
-          f"{lag168_nan.issubset(lag336_nan)}")
+          f"{_report['lag_168_subset_of_lag_336']}")
     print(f"  roll_168_lag168 NaN set subset of lag_336 NaN set: "
-          f"{roll_nan.issubset(lag336_nan)}")
+          f"{_report['roll_168_lag168_subset_of_lag_336']}")
 
     features, rows_dropped_for_nan = load_and_engineer(DATA_PATH)
     print("Integrity guards passed: flag columns are bool, hourly series is "
