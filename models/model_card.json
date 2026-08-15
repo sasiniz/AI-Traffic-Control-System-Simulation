@@ -1,5 +1,5 @@
 {
-  "training_row_count": 40320,
+  "training_row_count": 39648,
   "test_row_count": 17376,
   "split_date": "2017-01-01",
   "feature_columns": [
@@ -15,27 +15,59 @@
     "road_South",
     "road_West",
     "lag_168",
-    "roll_mean_24"
+    "lag_336",
+    "roll_168_lag168"
   ],
   "sklearn_version": "1.9.0",
-  "n_estimators": 300,
+  "n_estimators": 100,
+  "max_depth": 10,
+  "target_mode": "diff",
   "random_state": 42,
-  "test_metrics_per_road": {
-    "East": {
-      "MAE": 4.6943,
-      "RMSE": 8.8568
+  "selected_via": "model_selection.py validation grid - see results/MODEL_SELECTION.md",
+  "protocols": {
+    "static": {
+      "description": "fit once on the full training period, predict all of test",
+      "test_metrics_per_road": {
+        "East": {
+          "MAE": 5.7009,
+          "RMSE": 10.8742
+        },
+        "North": {
+          "MAE": 9.7202,
+          "RMSE": 15.0249
+        },
+        "South": {
+          "MAE": 4.6478,
+          "RMSE": 6.113
+        },
+        "West": {
+          "MAE": 2.0645,
+          "RMSE": 2.8288
+        }
+      }
     },
-    "North": {
-      "MAE": 7.2725,
-      "RMSE": 10.6189
-    },
-    "South": {
-      "MAE": 3.0833,
-      "RMSE": 4.228
-    },
-    "West": {
-      "MAE": 2.034,
-      "RMSE": 2.757
+    "rolling": {
+      "description": "refit every 7 days on an expanding window, predict only that week - matches ADR-012's weekly regeneration",
+      "n_refits": 26,
+      "deployment_representative": true,
+      "test_metrics_per_road": {
+        "East": {
+          "MAE": 5.315,
+          "RMSE": 10.2023
+        },
+        "North": {
+          "MAE": 6.4937,
+          "RMSE": 9.3458
+        },
+        "South": {
+          "MAE": 2.8037,
+          "RMSE": 3.6312
+        },
+        "West": {
+          "MAE": 2.0196,
+          "RMSE": 2.7897
+        }
+      }
     }
   }
 }

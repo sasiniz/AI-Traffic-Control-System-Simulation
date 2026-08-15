@@ -40,14 +40,38 @@ cannot beat that, it is not earning its place in the system and the report
 has to say so plainly. Computing and printing the baseline before the
 model is trained makes that comparison impossible to skip or bury.
 
-WHY NO HYPERPARAMETER TUNING
---------------------------------
-Hyperparameters must never be tuned against the test set - that turns the
-held-out future into training data in disguise, and the honest evaluation
-established in ADR-008 would be lost. n_estimators=300 is fixed, and
-max_depth / min_samples_leaf are left at sklearn defaults. If tuning is
-done later, the validation set must be carved temporally out of TRAIN
-(for example the last two months of 2016), never out of test.
+HYPERPARAMETERS AND TARGET MODE: SELECTED ON VALIDATION, NOT TUNED HERE
+----------------------------------------------------------------------------
+n_estimators=100, max_depth=10 and the DIFF target (see below) were not
+chosen in this file. They were selected by model_selection.py, which
+compared 39 configurations - 5 model families x 3 target modes - on a
+12-week validation split carved out of TRAIN, never on test. See
+results/MODEL_SELECTION.md for the full comparison and results/RESULTS_LOG.md
+for the provenance trail. This file trains the SELECTED configuration and
+reports it under two TEST protocols (static and rolling, both below) - test
+is touched here for measurement, never for selection, matching ADR-013.
+
+WHY THE TARGET IS Vehicles - lag_168 ("diff"), NOT Vehicles DIRECTLY
+-------------------------------------------------------------------------
+A Random Forest predicts the mean of the training rows in a leaf, so its
+raw-count predictions cannot exceed the maximum Vehicles value seen in
+training. Demand keeps rising past the train/test boundary (ADR-008), and
+the static-protocol raw-target model lost to the naive baseline as a
+direct result (see results/MODEL_SELECTION.md, section 6). Training on
+Vehicles - lag_168 instead, and adding lag_168 back at predict time, moves
+the ceiling: lag_168 is an actual historical count carried forward from the
+input row, not a value the forest has to have seen in training, so the
+model's OUTPUT is no longer pinned to a fixed training-period maximum even
+though the underlying forest's DIFFERENCE predictions still are. This is
+why the rolling protocol (which keeps lag_168 current via weekly refits)
+recovers accuracy that the static protocol cannot - see STEP 4b below.
+
+The inversion is INTERNAL to DiffTargetRandomForest (model_wrapper.py, not
+this file - see that module's docstring for why it lives separately).
+Every caller of model.predict() - this file, a future Stage 3 allocation
+layer, anything that joblib.load()s models/count_model.joblib - receives
+vehicle counts. Nothing downstream ever sees, or needs to know about, the
+diff representation.
 
 WHY WEST IS REPORTED SEPARATELY, NEVER BLENDED INTO A HEADLINE FIGURE
 --------------------------------------------------------------------------
@@ -73,14 +97,35 @@ hidden behind a single number.
 
 WHY THE TRAINING-RANGE LIMITATION IS REPORTED, NOT FIXED
 --------------------------------------------------------------
-A Random Forest regressor predicts the mean of the training rows that land
-in a leaf, so it can never output a value above the maximum (or below the
-minimum) target it saw during training. When the real world exceeds that
-range - which it does here, since demand grows across the train/test
-boundary (ADR-008) - the model is structurally unable to be correct on
-those rows, no matter how it is tuned. This is reported as a known
-limitation. It is not clipped, corrected, or hidden, because doing so
-would misrepresent what the model actually learned.
+The underlying forest still cannot output a DIFFERENCE (Vehicles - lag_168)
+outside the range of differences it saw in training - that part of the
+leaf-mean argument is unchanged by the target transform. What changed is
+where the ceiling sits in VEHICLE-COUNT terms: under the static protocol,
+lag_168 in the test period is real, later, higher-level data than anything
+lag_168 held during training, so the effective count ceiling
+(train-diff-max + test-period lag_168) floats upward with demand even
+though the forest's own diff predictions do not. This is reported as a
+known limitation, still measured directly (see STEP 7) rather than assumed
+away, and it is not clipped, corrected or hidden, because doing so would
+misrepresent what the model actually learned.
+
+STATIC vs ROLLING PROTOCOL, BOTH REPORTED
+---------------------------------------------
+STATIC (STEP 4): fit once on the full training period, predict all of
+test - what every earlier Stage 2 run in this project did.
+ROLLING (STEP 4b): refit every 7 days on everything seen so far (an
+expanding window that, for later weeks, includes earlier, now-realised
+test weeks as training data) and predict only that week - matching
+ADR-012's weekly regeneration. This duplicates a small amount of logic
+from model_selection.py rather than importing it, on the same reasoning
+ADR-019 gives for explore_features.py's independence from data_prep.py:
+this is the production evaluation and should not depend on the
+exploratory selection script.
+
+Both protocols are measured and both are written to models/model_card.json
+(STEP 8) - the rolling figures are labelled deployment-representative
+there, per ADR-012, because weekly regeneration is how this model is
+actually meant to run, not a fit-once-forget-it artefact.
 """
 
 import json
@@ -91,7 +136,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
 from data_prep import (
@@ -103,15 +147,27 @@ from data_prep import (
     load_and_engineer,
     temporal_split,
 )
+from model_wrapper import DiffTargetRandomForest
 
 MODEL_DIR = Path("models")
 MODEL_PATH = MODEL_DIR / "count_model.joblib"
 MODEL_CARD_PATH = MODEL_DIR / "model_card.json"
 
-N_ESTIMATORS = 300
+# Selected by model_selection.py's validation grid - see
+# results/MODEL_SELECTION.md. Not tuned in this file.
+N_ESTIMATORS = 100
+MAX_DEPTH = 10
+TARGET_MODE = "diff"  # Vehicles - lag_168, inverted internally - see DiffTargetRandomForest
 RANDOM_STATE = 42
 
+ROLL_WEEK_DAYS = 7  # rolling-protocol refit cadence, matching ADR-012
+
 ROADS = ["East", "North", "South", "West"]
+
+# DiffTargetRandomForest lives in model_wrapper.py, not here - see that
+# file's docstring for why (joblib.load() from any OTHER script would
+# otherwise fail, since this file's classes pickle under "__main__" when
+# run the normal way: `python train_model.py`).
 
 # Naive baseline values computed independently on 2026-08-03 (recorded for
 # reproducibility). This run's own baseline is compared against these
@@ -143,7 +199,7 @@ def mae_rmse(actual, predicted):
 def main():
     print("=== Stage 1 features (via data_prep.load_and_engineer) ===")
     features, rows_dropped = load_and_engineer(DATA_PATH)
-    print(f"Rows dropped for NaN lag_168/roll_mean_24 upstream: {rows_dropped}")
+    print(f"Rows dropped for NaN lag_168/lag_336/roll_168_lag168 upstream: {rows_dropped}")
     print(f"Feature rows: {len(features)}")
 
     train_df, test_df = temporal_split(features)
@@ -197,26 +253,30 @@ def main():
     print("All baseline values match the recorded state exactly.")
 
     # ---------------------------------------------------------------
-    # STEP 3: train the Random Forest. No hyperparameter tuning, no
-    # outlier exclusion - see module docstring and ADR-010.
+    # STEP 3: train the selected configuration (STATIC protocol - fit
+    # once on the full training period). No hyperparameter tuning here -
+    # n_estimators/max_depth/target mode were selected by
+    # model_selection.py on validation - and no outlier exclusion - see
+    # module docstring and ADR-010.
     # ---------------------------------------------------------------
     print()
-    print("=== Training RandomForestRegressor ===")
-    model = RandomForestRegressor(
+    print("=== Training DiffTargetRandomForest (STATIC protocol) ===")
+    model = DiffTargetRandomForest(
         n_estimators=N_ESTIMATORS,
+        max_depth=MAX_DEPTH,
         random_state=RANDOM_STATE,
-        n_jobs=-1,
     )
     t0 = time.time()
     model.fit(X_train, y_train)
     print(f"Trained on {len(X_train)} rows in {time.time() - t0:.1f}s "
-          f"(n_estimators={N_ESTIMATORS}, random_state={RANDOM_STATE}, "
-          f"max_depth=default, min_samples_leaf=default)")
+          f"(n_estimators={N_ESTIMATORS}, max_depth={MAX_DEPTH}, "
+          f"random_state={RANDOM_STATE}, target={TARGET_MODE})")
 
     # ---------------------------------------------------------------
     # STEP 4: evaluate on the test split. East/North/South form the
     # headline "overall" figure; West is measured and printed but never
-    # blended into it - see module docstring.
+    # blended into it - see module docstring. model.predict() already
+    # returns vehicle counts (DiffTargetRandomForest inverts internally).
     # ---------------------------------------------------------------
     y_pred = model.predict(X_test)
 
@@ -263,29 +323,101 @@ def main():
           f"mean_actual={mean_actual_w:.2f}  mean_predicted={mean_pred_w:.2f}")
 
     # ---------------------------------------------------------------
-    # STEP 5: baseline vs model, side by side, per road.
+    # STEP 4b: ROLLING protocol - refit every ROLL_WEEK_DAYS on an
+    # expanding window, predict only that week, matching ADR-012's weekly
+    # regeneration. Duplicated from model_selection.py rather than
+    # imported - see the module docstring's "STATIC vs ROLLING PROTOCOL"
+    # section for why.
     # ---------------------------------------------------------------
     print()
-    print("=== Baseline vs model, per road ===")
-    header = f"{'Road':6s}  {'Base MAE':>9s}  {'Base RMSE':>9s}  {'Model MAE':>9s}  {'Model RMSE':>10s}  {'MAE improve':>11s}  {'RMSE improve':>12s}  Beat baseline?"
+    print("=== Training DiffTargetRandomForest (ROLLING protocol) ===")
+    test_start = pd.Timestamp(SPLIT_DATE)
+    test_end_exclusive = test_df["DateTime"].max() + pd.Timedelta(hours=1)
+    week_starts = []
+    cur = test_start
+    while cur < test_end_exclusive:
+        week_starts.append(cur)
+        cur += pd.Timedelta(days=ROLL_WEEK_DAYS)
+
+    rolling_pred = np.full(len(test_df), np.nan)
+    t0 = time.time()
+    for week_start in week_starts:
+        week_end = min(week_start + pd.Timedelta(days=ROLL_WEEK_DAYS), test_end_exclusive)
+        # Expanding window: everything available by week_start, which for
+        # later weeks includes EARLIER, now-realised test weeks - exactly
+        # what weekly regeneration means in deployment.
+        rolling_train_df = features.loc[features["DateTime"] < week_start]
+        week_mask = ((test_df["DateTime"] >= week_start)
+                     & (test_df["DateTime"] < week_end)).to_numpy()
+
+        X_roll, y_roll = feature_matrix(rolling_train_df)
+        week_model = DiffTargetRandomForest(
+            n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH, random_state=RANDOM_STATE,
+        )
+        week_model.fit(X_roll, y_roll)
+
+        X_week, _ = feature_matrix(test_df.loc[week_mask])
+        rolling_pred[week_mask] = week_model.predict(X_week)
+
+    n_refits = len(week_starts)
+    assert not np.isnan(rolling_pred).any(), (
+        "rolling protocol left some test rows unpredicted - week boundaries "
+        "do not cover the full test period"
+    )
+    print(f"{n_refits} refits, one per {ROLL_WEEK_DAYS}-day block, "
+          f"{week_starts[0]} to {week_starts[-1]}, in {time.time() - t0:.1f}s total")
+
+    rolling_metrics = {}
+    for road in ["East", "North", "South"]:
+        mask = (test_df["Road"] == road).to_numpy()
+        mae, rmse = mae_rmse(actual[mask], rolling_pred[mask])
+        rolling_metrics[road] = {"MAE": mae, "RMSE": rmse}
+        print(f"{road:6s}  MAE={mae:.2f}  RMSE={rmse:.2f}")
+    overall_mask = (test_df["Road"] != "West").to_numpy()
+    mae_ro, rmse_ro = mae_rmse(actual[overall_mask], rolling_pred[overall_mask])
+    rolling_metrics["OVERALL_excl_West"] = {"MAE": mae_ro, "RMSE": rmse_ro}
+    print(f"{'OVERALL':6s}  MAE={mae_ro:.2f}  RMSE={rmse_ro:.2f}  "
+          f"(East+North+South; deployment-representative per ADR-012)")
+    mask = (test_df["Road"] == "West").to_numpy()
+    mae_rw, rmse_rw = mae_rmse(actual[mask], rolling_pred[mask])
+    rolling_metrics["West"] = {"MAE": mae_rw, "RMSE": rmse_rw}
+    print(f"{'West':6s}  MAE={mae_rw:.2f}  RMSE={rmse_rw:.2f}")
+
+    # ---------------------------------------------------------------
+    # STEP 5: baseline vs model, side by side, per road. STATIC and
+    # ROLLING both shown against the same baseline.
+    # ---------------------------------------------------------------
+    print()
+    print("=== Baseline vs model, per road (STATIC and ROLLING) ===")
+    header = (f"{'Road':6s}  {'Base MAE':>9s}  {'Base RMSE':>9s}  "
+              f"{'Static MAE':>10s}  {'Static RMSE':>11s}  "
+              f"{'Roll MAE':>9s}  {'Roll RMSE':>10s}  "
+              f"{'Static beats?':>13s}  {'Roll beats?':>11s}")
     print(header)
     for road in ["East", "North", "South", "West"]:
         b = baseline_metrics[road]
         m = model_metrics[road]
-        mae_improve = 100 * (b["MAE"] - m["MAE"]) / b["MAE"]
-        rmse_improve = 100 * (b["RMSE"] - m["RMSE"]) / b["RMSE"]
-        beat = "YES" if (m["MAE"] < b["MAE"] and m["RMSE"] < b["RMSE"]) else "NO"
-        print(f"{road:6s}  {b['MAE']:9.2f}  {b['RMSE']:9.2f}  {m['MAE']:9.2f}  "
-              f"{m['RMSE']:10.2f}  {mae_improve:10.1f}%  {rmse_improve:11.1f}%  {beat}")
+        r = rolling_metrics[road]
+        static_beat = "YES" if (m["MAE"] < b["MAE"] and m["RMSE"] < b["RMSE"]) else "NO"
+        roll_beat = "YES" if (r["MAE"] < b["MAE"] and r["RMSE"] < b["RMSE"]) else "NO"
+        print(f"{road:6s}  {b['MAE']:9.2f}  {b['RMSE']:9.2f}  "
+              f"{m['MAE']:10.2f}  {m['RMSE']:11.2f}  "
+              f"{r['MAE']:9.2f}  {r['RMSE']:10.2f}  "
+              f"{static_beat:>13s}  {roll_beat:>11s}")
 
     # ---------------------------------------------------------------
     # STEP 6: permutation importance (test set) vs built-in
-    # feature_importances_ (train-derived), side by side.
+    # feature_importances_ (train-derived), side by side. Scoring is
+    # explicit rather than left at permutation_importance's default
+    # (which would use DiffTargetRandomForest.score(), i.e. R^2 via
+    # RegressorMixin) because neg_mean_absolute_error matches this
+    # project's chosen metric - see module docstring's METRICS section.
     # ---------------------------------------------------------------
     print()
     print("=== Feature importance: permutation (test set) vs built-in ===")
     perm = permutation_importance(
         model, X_test, y_test, n_repeats=5, random_state=RANDOM_STATE, n_jobs=-1,
+        scoring="neg_mean_absolute_error",
     )
     importance_df = pd.DataFrame({
         "feature": FEATURE_COLUMNS,
@@ -360,11 +492,32 @@ def main():
         "feature_columns": FEATURE_COLUMNS,
         "sklearn_version": sklearn.__version__,
         "n_estimators": N_ESTIMATORS,
+        "max_depth": MAX_DEPTH,
+        "target_mode": TARGET_MODE,
         "random_state": RANDOM_STATE,
-        "test_metrics_per_road": {
-            road: {"MAE": round(model_metrics[road]["MAE"], 4),
-                   "RMSE": round(model_metrics[road]["RMSE"], 4)}
-            for road in ["East", "North", "South", "West"]
+        "selected_via": "model_selection.py validation grid - see results/MODEL_SELECTION.md",
+        "protocols": {
+            "static": {
+                "description": "fit once on the full training period, predict all of test",
+                "test_metrics_per_road": {
+                    road: {"MAE": round(model_metrics[road]["MAE"], 4),
+                           "RMSE": round(model_metrics[road]["RMSE"], 4)}
+                    for road in ["East", "North", "South", "West"]
+                },
+            },
+            "rolling": {
+                "description": (
+                    f"refit every {ROLL_WEEK_DAYS} days on an expanding window, "
+                    "predict only that week - matches ADR-012's weekly regeneration"
+                ),
+                "n_refits": n_refits,
+                "deployment_representative": True,
+                "test_metrics_per_road": {
+                    road: {"MAE": round(rolling_metrics[road]["MAE"], 4),
+                           "RMSE": round(rolling_metrics[road]["RMSE"], 4)}
+                    for road in ["East", "North", "South", "West"]
+                },
+            },
         },
     }
     with open(MODEL_CARD_PATH, "w") as fh:
