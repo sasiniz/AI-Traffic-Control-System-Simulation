@@ -1,0 +1,12 @@
+{
+  "script": "model_selection.py",
+  "run_datetime": "2026-08-15T15:59:33",
+  "commit": "df4864f",
+  "working_tree_dirty": true,
+  "random_state": 42,
+  "produced_files": [
+    "results\\model_selection_validation.csv",
+    "results\\model_selection_test.csv",
+    "results\\MODEL_SELECTION.md"
+  ]
+}
