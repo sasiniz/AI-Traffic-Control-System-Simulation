@@ -1228,3 +1228,303 @@ superseded artefact, but it should not be cited.
 **Sources**
 None, design decision. Sample window figures measured on
 data/traffic_final_cleaned.csv on 2026-08-14.
+
+---
+
+## ADR-020: Model family and hyperparameters selected by measurement
+
+**Date:** 2026-08-16
+**Status:** Accepted
+**Supersedes the qualitative justification in ADR-007. Supersedes the test
+metrics in ADR-011 and ADR-014.**
+
+**Context**
+
+ADR-007 chose Random Forest on qualitative grounds: it handles cyclical
+features, is lighter than an LSTM, and yields feature importances. No
+alternative was ever measured against it. That is not a defensible
+justification for a dissertation.
+
+After ADR-015 removed the leaking feature, the model lost to a seasonal
+naive baseline on test, so the choice needed testing rather than assuming.
+
+**Decision**
+
+model_selection.py compares 39 configurations plus the seasonal naive
+baseline. Four model families: Ridge, Decision Tree at depth 10, Random
+Forest across n_estimators 100/200/300 and max_depth None/10/20, and
+HistGradientBoosting. Plus a hybrid fitting Ridge for the level and a
+Random Forest on its residual.
+
+Each ran under three target modes: raw counts, diff (Vehicles minus
+lag_168, added back at prediction time) and ratio (Vehicles divided by
+roll_168_lag168, multiplied back). These are seasonal differencing and
+multiplicative decomposition, both standard.
+
+Selection used validation only, the last 12 weeks of the training period,
+per ADR-013. The rule was fixed before results were seen: lowest
+OVERALL_excl_West MAE, and where configurations tie within 0.1, prefer the
+simpler by fewer trees, then shallower depth, then simpler target mode.
+
+Selected: RandomForestRegressor(n_estimators=100, max_depth=10) on the diff
+target, validation MAE 4.073.
+
+**Alternatives rejected**
+
+The hybrid. Best hybrid validation MAE was 4.245 against Random Forest's
+4.073. It did not win and is recorded as a measured result, not omitted.
+Ridge with the ratio target, worst of all 39 at 8.732. A linear model
+extrapolates, so multiplying an extrapolated ratio by a rising level anchor
+compounds the error rather than correcting it.
+HistGradientBoosting, worse than the naive baseline on validation.
+The raw target, which is what the collapse in ADR-015 exposed.
+Re-sweeping hyperparameters during the corrected Stage 2 re-run. Rejected
+so the only variable between ADR-014 and that run was the feature set.
+
+**Consequences**
+
+Two evaluation protocols were measured on test, and they disagree.
+
+    STATIC, fit once on the whole training period
+      overall excl West  6.69 MAE   naive baseline 5.22   LOSES
+    ROLLING, refit weekly across the test period
+      overall excl West  4.87 MAE   naive baseline 5.22   WINS
+
+The static protocol is not how the system runs. ADR-012 regenerates the
+schedule weekly, so the model retrains weekly. Evaluating it as though
+trained once on six months measured something the design never does.
+
+The rolling result does NOT beat the baseline on every road:
+
+    East    5.31 vs 6.49   better by 1.18
+    West    2.02 vs 2.65   better by 0.63
+    South   2.80 vs 2.88   better by 0.08, effectively tied
+    North   6.49 vs 6.30   WORSE by 0.19
+
+The overall win is carried almost entirely by East. North, the busiest
+road, still loses to copying last week. This must be stated wherever the
+overall figure is quoted.
+
+The 0.351 margin is roughly 30x the seed-to-seed variation recorded in
+ADR-016 (0.0119 MAE). That is not a formal significance test, since one is
+seed variance and the other a protocol comparison, but the margin is not an
+artefact of randomness.
+
+Validation could not have found this. Measured drift, South, is 1.31x from
+inner-train to validation but 1.88x from train to test. The validation
+period simply does not contain the distribution shift that breaks the
+static model, which is why ADR-015's validation table showed South healthy
+at 2.51 while test returned 6.28. Validation-based selection was performed
+correctly and still selected a configuration that fails under the shift.
+That is a limitation of the protocol, not an error in applying it.
+
+Test evaluation count, disclosed rather than minimised: four evaluations
+informed selection decisions (ADR-014, the corrected re-run, and the two
+protocols here), plus one rolling protocol comprising 26 weekly refits on
+which no selection was performed.
+
+Full results are committed at results/MODEL_SELECTION.md with the
+underlying tables as CSV, indexed in results/RESULTS_LOG.md.
+
+**Sources**
+
+R. J. Hyndman and G. Athanasopoulos, Forecasting: Principles and Practice,
+2nd ed. Melbourne: OTexts, 2018, section 6.3, for classical additive and
+multiplicative decomposition.
+Improved Sales Forecasting using Trend and Seasonality Decomposition with
+LightGBM, arXiv:2305.17201, for the inability of tree ensembles to
+extrapolate beyond the training range.
+J. Lu et al., "Learning under concept drift: A review," IEEE Transactions
+on Knowledge and Data Engineering, vol. 31, no. 12, 2018.
+
+---
+
+## ADR-021: Cycle length 120 s, minimum green 12 s, proportional allocation
+
+**Date:** 2026-08-16
+**Status:** Accepted
+**Extends ADR-006, which is not modified. Records ADR-006's change of
+status from active to structurally unreachable.**
+
+**Context**
+
+generate_timeline.py compiled a hardcoded three hour plan. The model had
+never driven the schedule, so the project's central claim was unevidenced.
+Connecting them required deciding how predicted vehicle counts become green
+seconds, which needed a cycle length, a minimum green and an allocation
+rule. None of these had been decided.
+
+**Decision**
+
+    CYCLE_SECONDS      = 120
+    AMBER_SECONDS      = 3, unchanged
+    MIN_GREEN_SECONDS  = 12
+    available green    = 120 - 4x3          = 108
+    committed          = 4x12               = 48
+    discretionary      = 108 - 48           = 60
+    implied maximum    = 12 + 60            = 72
+
+Each road receives 12 seconds plus its share of the 60 discretionary
+seconds, where share is that road's predicted count over the four road
+total. Rounding uses largest remainder: floor every share, then distribute
+leftover seconds to the roads with the largest fractional parts.
+
+**Alternatives rejected**
+
+Deriving cycle length from Webster's formula. Measured on this dataset,
+Y is 0.042 in a mean hour and 0.221 in the busiest, giving an optimal cycle
+of 24 to 30 seconds. Both sit below the practical minimum used in real
+installations. Rejected because the junction runs at a degree of saturation
+of 0.05 to 0.25, where a signalised junction is normally designed around
+0.85 to 0.95. There is almost no demand to optimise against, so the formula
+returns a degenerate answer. Cycle length is therefore a documented design
+assumption, not a derived value, and this must be stated in the
+methodology.
+A 60 second cycle. Four roads at a 12 second floor consume the entire 48
+seconds of available green, leaving zero discretionary time. Every road
+would receive 12 seconds regardless of prediction and the model would have
+no influence at all. This is a hard lower bound the design cannot approach.
+A 90 second cycle, 30 discretionary seconds. Rejected because the resulting
+allocation compresses a 6.3 to 1 traffic ratio into 1.9 to 1, making the
+model's output barely visible in the schedule.
+A 7 second minimum green, the UK regulatory figure. Already rejected in
+ADR-006 for the same reason it is rejected here: a 7 second phase is legal
+but clears almost nothing.
+Naive rounding. Measured across all 14592 hours in the dataset, round()
+fails to sum to 108 in 33.7 percent of cases, which would leave a third of
+cycles at 107 or 109 seconds and the hour would not close.
+
+**Consequences**
+
+3600 divided by 120 is exactly 30, so no hour can end mid phase. ADR-006's
+boundary rule cannot fire. Verified: trigger count across 168 hours is 0.
+
+A fencepost bug was found during that verification. The phase level
+lookahead asks whether the next phase fits in the remaining budget, which
+is trivially false at the last phase of any hour regardless of whether the
+cycle divides evenly. It fired 168 times, once per hour, while producing
+numerically identical output. Fixed by emitting whole cycles directly when
+the cycle divides the hour exactly. ADR-006's path remains in the code and
+is reachable only when it does not. The rule is therefore structurally
+unreachable under this cycle length, not merely arithmetically dormant.
+It is retained rather than removed because it becomes live again
+immediately if the cycle changes to a value that does not divide 3600.
+
+ADR-006's 12 second derivation remains load bearing. It is now the per
+phase minimum green rather than only a boundary threshold. Its five vehicle
+basis, previously justified by matching ANOMALY_QUEUE_MIN in
+traffic_sim.py, is now supported externally: at 30 cycles per hour, North's
+busiest hour in the dataset delivers 5.2 vehicles per cycle, requiring
+2.0 + 5.2 x 1.9 = 11.9 seconds. The constant and the data agree.
+
+Observed output over the 168 hour horizon:
+
+    North  41 to 52 s      South  20 to 28 s
+    East   17 to 26 s      West   15 to 22 s
+    equal split baseline   27 s per road
+
+The model gives the dominant approach roughly 1.7 times an equal share.
+Hour to hour variation is modest, standard deviation 2.24 seconds for
+North, because the proportional split between approaches is stable across
+the day even though absolute volumes vary by a factor of six. North's mean
+share ranges only from 53.9 percent at hour 17 to 57.4 percent at hour 10.
+The model's contribution is in setting correct proportions, not in varying
+them hourly, and the writeup must claim that rather than dynamic
+responsiveness.
+
+Worst case waiting time is 105 seconds, for a road on the 12 second floor.
+This bound is reached in the dataset. It is the price paid for the 120
+second cycle, which was chosen so the model has room to act.
+
+44 percent of available green is committed to the floor before the model is
+consulted. With four approaches and a 12 second minimum this is
+unavoidable at any cycle length in the practical range.
+
+The fixed cycle does not shorten at low demand, so a 3am hour with 13
+vehicles and a 9am hour with 350 receive similar green times. A demand
+responsive cycle length would address this and is recorded as future work.
+
+**Sources**
+
+Transportation Research Board, Highway Capacity Manual, 6th ed.
+Washington, DC, 2016. Saturation headway 1.9 s per vehicle, yielding an
+ideal saturation flow of 1900 veh/h of green; start up lost time default
+2.0 s.
+F. V. Webster, Traffic Signal Settings, Road Research Technical Paper
+No. 39. London: HMSO, 1958, for the optimal cycle formula.
+McTrans, University of Florida, Calibrating Driver Behavior at Signalized
+Intersections, noting a University of Central Florida study proposing 3.5 s
+start up lost time instead of the HCM default. A higher value would raise
+the floor above 12 s, so 12 s is the conservative end of the range.
+
+---
+
+## ADR-022: Night time flashing amber operation considered and rejected
+
+**Date:** 2026-08-16
+**Status:** Accepted
+
+**Context**
+
+Many junctions in Sri Lanka switch to flashing amber on all approaches
+overnight, allowing vehicles to cross at their own judgement. This is
+established local practice and was considered as a night time efficiency
+measure for the scheduler, since the fixed 120 second cycle in ADR-021
+continues to run regardless of demand.
+
+**Decision**
+
+Not implemented. The schedule runs the same cycle structure for all 24
+hours.
+
+**Alternatives rejected**
+
+Flashing amber on all four approaches between 22:00 and 04:00, as practised
+locally.
+Flashing amber on the dominant approach with flashing red on the other
+three, the arrangement defined by MUTCD as an Intersection Control Beacon.
+
+**Consequences**
+
+Rejected on three measured grounds.
+
+First, this dataset has no night lull. Mean total across all four
+approaches is 74.9 vehicles per hour between 22:00 and 04:00 against 86.0
+between 06:00 and 20:00, only 13 percent lower. The genuine minimum is
+43.0 at 05:00, not the middle of the night, and midnight at 82.5 is busier
+than 08:00 at 57.8. A 22:00 to 04:00 flashing window would remove control
+during hours nearly as busy as the daytime.
+
+Second, the safety evidence runs against the practice. FHWA reports an
+estimated 78 percent reduction in right angle collisions and an estimated
+32 percent reduction in all collisions from removing late night flash mode.
+The practice is being withdrawn rather than extended.
+
+Third, a consistency problem. If low volume justified reduced control at
+night, the same argument would apply throughout. The busiest single hour
+across all four approaches is 353 vehicles, and signal warrants are
+normally based on volumes sustained across at least eight hours of an
+average day. At these volumes a signalised junction may not be warranted at
+any hour. This limitation belongs in the methodology whether or not
+flashing operation is implemented.
+
+The rejection is specific to this dataset and to the evidence cited. It is
+not a claim that the local practice is wrong in general, and no
+jurisdictional standard governing Sri Lankan installations was consulted.
+MUTCD is a United States standard cited only for its definition of the
+arrangements considered, and its prohibition on flashing amber facing
+conflicting approaches has no force here. Establishing what Sri Lankan
+practice permits, and whether the FHWA crash reduction transfers to local
+conditions, would require sources not available for this project and is
+recorded as a limitation rather than settled.
+
+**Sources**
+
+Manual on Uniform Traffic Control Devices, Chapter 4L, Flashing Beacons,
+Federal Highway Administration.
+https://mutcd.fhwa.dot.gov/HTM/2009/part4/part4l.htm
+Missouri DOT Engineering Policy Guide 902.7, citing FHWA, Signalized
+Intersections: Informational Guide, FHWA-HRT-04-091.
+https://epg.modot.org/index.php?title=902.7_Flashing_Operation_of_Traffic_Control_Signals_(MUTCD_Chapter_4G)
+MUTCD 11th Edition, Part 4, Chapter 4C signal warrants.
+https://mutcd.fhwa.dot.gov/pdfs/11th_Edition/part4.pdf
