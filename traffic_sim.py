@@ -228,13 +228,17 @@ def _bezier_length(p0, c, p2, samples=16):
 # scheduler is ready, replacing the CSV at this path with its real annual
 # output is the only change needed - nothing in SignalController changes.
 #
-# Playback is independent of the simulation's own clock (START_HOUR and
-# elapsed sim_time): it starts at the first row and loops back to the start
-# once the file is exhausted. The CSV's own start_hour column is provenance
-# information, not something the simulation actively synchronises against.
+# Playback PACING is independent of the simulation's own clock (START_HOUR
+# and elapsed sim_time): it starts at the first row and loops back to the
+# start once the file is exhausted, stepping forward purely by elapsed dt,
+# never by matching wall-clock time to the CSV's dates. The CSV's date and
+# start_hour columns ARE read and surfaced for DISPLAY (the control panel's
+# "SCHEDULE SOURCE" line - SECTION 15), so a viewer can see which real dated
+# artefact is currently playing, but nothing about playback timing or
+# sequencing depends on them.
 
 SIGNAL_TIMELINE_PATH = os.path.join(os.path.dirname(__file__),
-                                    "signal_timeline_sample.csv")
+                                    "signal_timeline.csv")
 
 
 def _load_signal_timeline(path):
@@ -246,6 +250,8 @@ def _load_signal_timeline(path):
                 "road": row["road"],
                 "green": float(row["green_seconds"]),
                 "amber": float(row["amber_seconds"]),
+                "date": row["date"],
+                "start_hour": int(row["start_hour"]),
             })
     if not phases:
         raise ValueError(f"{path} has no phase rows")
@@ -352,6 +358,13 @@ class SignalController:
         if arm != self.phase:
             return RED
         return AMBER if self.in_amber else GREEN
+
+    def current_datetime_label(self):
+        """(date, start_hour) of the phase currently playing, as loaded
+        from the timeline file - for the dashboard only (SECTION 15). Not
+        used anywhere in signal timing itself."""
+        current = self.timeline[self.phase_pos]
+        return current["date"], current["start_hour"]
 
     def remaining(self, arm):
         """Seconds left until this arm's state next changes, for the panel."""
@@ -1172,9 +1185,15 @@ class Renderer:
         self._button("CLEAR ACCIDENT  [X]", 16, 348, C_CARD)
         self._button("CAMERAS  [C]", 16, 396, C_BLUE if camera_on else C_CARD)
 
-        # Status.
+        # Status. Date/hour come from the timeline file's currently playing
+        # phase (SignalController.current_datetime_label), NOT from the
+        # simulation's own clock (sim.hour / sim.clock_string(), used only
+        # for the separate SIM CLOCK panel below and vehicle spawn rates) -
+        # this is what shows a viewer the schedule is a dated artefact
+        # rather than a constant.
+        sched_date, sched_hour = sim.signals.current_datetime_label()
         self.text("SCHEDULE SOURCE", 16, 470, self.f_small, C_MUTED)
-        self.text("pre-planned, hour " + f"{sim.hour:02d}", 16, 488, self.f_small, C_TEXT)
+        self.text(f"pre-planned, {sched_date} {sched_hour:02d}:00", 16, 488, self.f_small, C_TEXT)
         self.text("signals ignore incidents", 16, 506, self.f_small, C_MUTED)
 
         pygame.draw.rect(sc, C_CARD, (16, 620, 188, 62), border_radius=5)
