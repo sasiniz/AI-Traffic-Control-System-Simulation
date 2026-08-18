@@ -6,3 +6,7 @@ sensor_log.csv
 .vscode/
 models/count_model.joblib
 data/feature_table.csv
+# security module
+.pytest_cache/
+security/operators.json
+security_module.zip
