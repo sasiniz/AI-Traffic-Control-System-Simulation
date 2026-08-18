@@ -223,10 +223,20 @@ def test_sensor_spoofing_with_stolen_key_passes_encryption():
 # detection.py -- pure classification functions (1c)
 # ---------------------------------------------------------------------------
 
+# Mirrors traffic_sim.py's SIM_SATURATION_HEADWAY_S = MIN_GAP / (MAX_SPEED
+# * 60) = 48 / (2.2 * 60). test_security.py stays import-free of
+# traffic_sim.py (matching detection.py's own design), so this is an
+# independently-computed constant, not an import - see Phase A's ADR-027
+# for why compute_channel_signals takes this as a real physics parameter
+# rather than a module-level literal in detection.py.
+_SIM_SATURATION_HEADWAY_S = 48 / (2.2 * 60)  # 0.3636...
+
+
 def _channel_signals(**kwargs):
     defaults = dict(
         accepted=True, encryption_enabled=True,
         reported_vehicles=5, true_vehicles=5, green_seconds_window=20.0,
+        sim_saturation_headway_s=_SIM_SATURATION_HEADWAY_S,
     )
     defaults.update(kwargs)
     return detection.compute_channel_signals(**defaults)
@@ -242,11 +252,13 @@ def test_detection_s1_fires_only_when_rejected_and_encrypted():
 
 
 def test_detection_s2_implausible_uses_saturation_headway():
-    # Physical bound = green_seconds / 1.9. At green=20s, bound ~= 10.5.
-    just_over = _channel_signals(reported_vehicles=11, green_seconds_window=20.0)
-    just_under = _channel_signals(reported_vehicles=10, green_seconds_window=20.0)
+    # Physical bound = green_seconds / sim_saturation_headway_s (0.3636...,
+    # NOT the HCM 1.9s - see Phase A / ADR-027). At green=20s, bound = 55.0
+    # exactly (20 / (48/132) = 2640/48 = 55).
+    just_over = _channel_signals(reported_vehicles=56, green_seconds_window=20.0)
+    just_under = _channel_signals(reported_vehicles=55, green_seconds_window=20.0)
     assert just_over.s2_implausible is True
-    assert just_under.s2_implausible is False
+    assert just_under.s2_implausible is False, "55 is not > the bound of exactly 55.0"
 
 
 def test_detection_s2_does_not_fire_below_min_green_guard():
@@ -261,10 +273,10 @@ def test_detection_s2_does_not_fire_below_min_green_guard():
         "below S2_MIN_GREEN_S, S2 must not evaluate at all - even a genuine reading would trip it"
 
     # At the guard boundary (green == 6.0 exactly), S2 DOES evaluate:
-    # bound = 6.0/1.9 = 3.16, so 3 is plausible and 4 is not.
-    at_guard_plausible = _channel_signals(reported_vehicles=3, true_vehicles=3,
+    # bound = 6.0 / 0.3636... = 16.5, so 16 is plausible and 17 is not.
+    at_guard_plausible = _channel_signals(reported_vehicles=16, true_vehicles=16,
                                            green_seconds_window=6.0)
-    at_guard_implausible = _channel_signals(reported_vehicles=4, true_vehicles=4,
+    at_guard_implausible = _channel_signals(reported_vehicles=17, true_vehicles=17,
                                              green_seconds_window=6.0)
     assert at_guard_plausible.s2_implausible is False
     assert at_guard_implausible.s2_implausible is True, \

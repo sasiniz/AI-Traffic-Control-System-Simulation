@@ -25,16 +25,14 @@ THE FIVE SIGNALS
                       encryption off there is no integrity check to fail,
                       so S1 cannot fire (compute_signals gates on this).
   S2 IMPLAUSIBLE      the reported vehicle count exceeds the physical
-                      bound green_seconds / SATURATION_HEADWAY_S, i.e.
-                      more vehicles were reported than could physically
-                      have discharged in the green time available. The
-                      1.9s saturation headway is the Highway Capacity
-                      Manual value already used for MIN_GREEN_TO_START in
-                      traffic_sim.py (see DECISIONS.md ADR-006 and
-                      ADR-021) - derived from that existing citation, not
-                      invented here. Does not evaluate at all below
-                      S2_MIN_GREEN_S (6.0s) of green in the window - see
-                      that constant's comment for why.
+                      bound green_seconds / sim_saturation_headway_s, i.e.
+                      more vehicles were reported than this SIMULATION's
+                      own car-following physics could have discharged in
+                      the green time available - see "WHICH HEADWAY S2
+                      USES" below for why this is not the HCM figure.
+                      Does not evaluate at all below S2_MIN_GREEN_S (6.0s)
+                      of green in the window - see that constant's
+                      comment for why.
   S3 DIVERGENCE       the reported value differs from the true value that
                       was actually sent into the channel. See the
                       CRITICAL HONESTY REQUIREMENT below before trusting
@@ -51,6 +49,37 @@ THE FIVE SIGNALS
                       rate collapsed), passed in as a plain bool -
                       detection.py does not recompute it and does not
                       import SensorSystem.
+
+WHICH HEADWAY S2 USES (real-world HCM vs this simulation's own physics)
+-------------------------------------------------------------------------
+Two saturation headways are stated in this module, and they are NOT
+interchangeable:
+
+  HCM_SATURATION_HEADWAY_S = 1.9s. This is the correct real-world
+  constant (Highway Capacity Manual, 6th ed., Transportation Research
+  Board, Washington, DC, 2016) and IS the right bound to use for S2 in a
+  real deployment, judging a real sensor against real traffic.
+
+  sim_saturation_headway_s, passed in by the caller (traffic_sim.py),
+  derived there as MIN_GAP / (MAX_SPEED * 60). This simulation's car-
+  following model permits vehicles to queue much closer together, and
+  discharge much faster, than real traffic ever could: measured this
+  session, MIN_GAP=48px and MAX_SPEED=2.2px/frame give a minimum time
+  headway of 0.364s, against the HCM's 1.9s - a factor of 5.225. Applying
+  the HCM figure to counts that this simulation's OWN physics generated
+  produces false positives on entirely legitimate traffic: a recorded
+  case (green_s=9.917, discharged=7, no attack) exceeds the HCM bound
+  (5.22, flagged) but not the simulation's own bound (27.27, not
+  flagged) - proof that the HCM version was measuring the gap between
+  simulation physics and real-world physics, not attacker activity.
+
+  S2 therefore uses sim_saturation_headway_s, not
+  HCM_SATURATION_HEADWAY_S, for its bound. This is a deliberate choice
+  to judge simulated readings against the physics that actually produced
+  them. A real deployment reading real sensors would use the HCM figure
+  instead - do not port this substitution into a non-simulated context
+  without re-deriving the headway from the physics that actually apply
+  there.
 
 S5 IS UNREACHABLE AT DEMAND_MULTIPLIER = 1.0 (STATED, NOT TUNED AWAY)
 ------------------------------------------------------------------------
@@ -114,10 +143,11 @@ from typing import Dict, List, Optional
 # Highway Capacity Manual, 6th ed., Transportation Research Board,
 # Washington, DC, 2016. Saturation headway 1.9 s/vehicle - the same
 # citation and the same constant already used to derive MIN_GREEN_TO_START
-# in traffic_sim.py (see DECISIONS.md ADR-006, ADR-021). Reused here, not
-# re-derived, so the two files cannot silently disagree about what the HCM
-# says.
-SATURATION_HEADWAY_S = 1.9
+# in traffic_sim.py (see DECISIONS.md ADR-006, ADR-021). The correct
+# real-world bound, and NOT what S2 actually uses below - see "WHICH
+# HEADWAY S2 USES" in the module docstring. Kept as a named constant so
+# the real-world figure stays on record and citable, not deleted.
+HCM_SATURATION_HEADWAY_S = 1.9
 
 # See "CRITICAL HONESTY REQUIREMENT" above: zero is the structurally
 # correct value in this architecture, not a rounded-off guess.
@@ -129,19 +159,23 @@ DIVERGENCE_THRESHOLD_VEHICLES = 0
 # independent number for the same underlying judgement - "is there enough
 # green time in this window to judge fairly".
 #
-# Mechanism, not just a threshold: S2's bound is green_s / SATURATION_
-# HEADWAY_S. Below ~1.9s of green the bound drops under 1 vehicle, so ANY
-# discharge counted in the reading trips S2 - and that discharge is very
-# often real, carried over from a green phase that started just before the
-# 20s rolling window began. discharges and green_seconds_window are both
-# rolling-windowed independently and are not phase-aligned to each other:
-# a vehicle can be counted as "discharged in the last 20s" while almost
-# none of the green time that let it through falls inside that same 20s
-# slice. The root cause is that misalignment, not the choice of threshold
-# value - raising S2_MIN_GREEN_S papers over it without fixing it, so this
-# guard is deliberately set to the same figure already trusted elsewhere
-# in the codebase for "enough green to judge fairly", not tuned separately
-# to make false positives disappear.
+# Mechanism, not just a threshold: S2's bound is green_s /
+# sim_saturation_headway_s. Below that headway's worth of green the bound
+# drops under 1 vehicle, so ANY discharge counted in the reading trips S2
+# - and that discharge is very often real, carried over from a green
+# phase that started just before the 20s rolling window began.
+# discharges and green_seconds_window are both rolling-windowed
+# independently and are not phase-aligned to each other: a vehicle can be
+# counted as "discharged in the last 20s" while almost none of the green
+# time that let it through falls inside that same 20s slice. The root
+# cause is that misalignment, not the choice of threshold value - raising
+# S2_MIN_GREEN_S papers over it without fixing it, so this guard is
+# deliberately set to the same figure already trusted elsewhere in the
+# codebase for "enough green to judge fairly" (ANOMALY_MIN_GREEN_S), not
+# tuned separately to make false positives disappear. 6.0s comfortably
+# covers this regardless of which headway the bound itself uses - even
+# the old, much larger HCM_SATURATION_HEADWAY_S (1.9s) needed less than a
+# third of this to reach a 1-vehicle bound.
 S2_MIN_GREEN_S = 6.0
 
 # Given directly by the classification design (see module docstring S4):
@@ -204,16 +238,27 @@ def compute_channel_signals(
     reported_vehicles: Optional[int],
     true_vehicles: int,
     green_seconds_window: float,
+    sim_saturation_headway_s: float,
 ) -> "_ChannelSignals":
     """S1-S3 only: the signals derivable from ONE channel reading, without
     reference to other arms (S4) or the physical detector (S5). Kept
     separate from SignalFlags/classify() so S4's cross-arm aggregation
     (simultaneity_flag, below) can be computed from these first.
+
+    sim_saturation_headway_s is a REQUIRED parameter, not a module
+    constant, deliberately: it is derived from traffic_sim.py's MIN_GAP
+    and MAX_SPEED (sim_saturation_headway_s = MIN_GAP / (MAX_SPEED * 60)),
+    and this module stays import-free of traffic_sim (see module
+    docstring). Hardcoding a second copy of that arithmetic here would let
+    the two silently drift apart if MIN_GAP or MAX_SPEED ever changed;
+    requiring the caller to pass the live value keeps there being exactly
+    one place that number is computed. See "WHICH HEADWAY S2 USES" in the
+    module docstring for why this differs from HCM_SATURATION_HEADWAY_S.
     """
     s1 = (not accepted) and encryption_enabled
 
     if accepted and reported_vehicles is not None and green_seconds_window >= S2_MIN_GREEN_S:
-        physical_bound = green_seconds_window / SATURATION_HEADWAY_S
+        physical_bound = green_seconds_window / sim_saturation_headway_s
         s2 = reported_vehicles > physical_bound
     else:
         s2 = False

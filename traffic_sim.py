@@ -191,6 +191,24 @@ CRAWL_SPEED = 0.10               # speed when easing past an accident
                                  # well BELOW peak demand, otherwise a crawl
                                  # causes no queue and no anomaly to detect.
 MIN_GAP = 48                     # minimum centre to centre spacing in a queue
+
+# Minimum time headway this simulation's own car-following physics
+# permits, in seconds: the time for one MIN_GAP of following distance to
+# close at MAX_SPEED (px/frame, at 60 fps). Passed into
+# security/detection.py's S2 IMPLAUSIBLE check as sim_saturation_headway_s
+# - NOT the same as the Highway Capacity Manual's 1.9s real-world figure
+# (detection.py's HCM_SATURATION_HEADWAY_S), which is far more permissive
+# in the wrong direction here: this simulation can legitimately produce
+# tighter headways than real traffic ever could, so judging simulated
+# readings against the HCM figure flags genuine traffic as implausible.
+# See detection.py's "WHICH HEADWAY S2 USES" for the measured comparison.
+# Computed here, not duplicated as a second literal in detection.py, so
+# the two files cannot silently drift apart if MIN_GAP or MAX_SPEED ever
+# change - detection.py stays import-free of this module by design, so
+# the value is passed as a parameter at the call site (Simulation._classify)
+# instead.
+SIM_SATURATION_HEADWAY_S = MIN_GAP / (MAX_SPEED * 60.0)  # 48/(2.2*60) = 0.3636s
+
 GAP_RAMP = 60                    # distance over which speed ramps back up
 STOP_MARGIN = 4                  # how close the front bumper gets to a stop line
 STILL_BLOCKING_ZONE = VEH_LEN + MIN_GAP
@@ -1334,6 +1352,7 @@ class Simulation:
                 reported_vehicles=e["reported_vehicles"],
                 true_vehicles=e["true_vehicles"],
                 green_seconds_window=e["green_seconds_window"],
+                sim_saturation_headway_s=SIM_SATURATION_HEADWAY_S,
             )
             for e in this_tick_entries
         }
@@ -1350,6 +1369,7 @@ class Simulation:
                     accepted=True, encryption_enabled=self.channel.encryption_enabled,
                     reported_vehicles=None, true_vehicles=0,
                     green_seconds_window=self.sensors.green_s[arm],
+                    sim_saturation_headway_s=SIM_SATURATION_HEADWAY_S,
                 )
             results[arm] = threat_detection.classify(
                 channel=channel_signals,

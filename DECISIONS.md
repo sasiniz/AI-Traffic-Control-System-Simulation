@@ -1899,3 +1899,135 @@ the 52.9fps measurement): commit 9947df6 ("Separate TIME (honest
 fast-forward) from DENSITY (fabricated demand)"). Pinch capacity / peak
 demand arithmetic: commit fb379fe and commit 3458083 (also cited in
 ADR-024).
+
+## ADR-027: Correcting ADR-026's "no reported result used density != 1.0" claim; S2 headway correction
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Supersedes a specific claim in ADR-026, not the entry as a whole.**
+
+**Context**
+
+ADR-026's Consequences section states: "no reported result in this session
+used a density multiplier other than 1.0 — the evidence behind ADR-024 and
+ADR-025 was gathered at DEMAND_MULTIPLIER=1.0 throughout, with DEMAND_LEVELS
+used only for the demonstration-specific reviews that are themselves about
+the multiplier's own effect." This is contradicted by ADR-025's own
+Consequences section, re-read directly before writing this correction:
+"Before the S2_MIN_GREEN_S guard (commit 0e869d0): 0.14-0.28% at demand 1x,
+9/120 (7.50%) at demand 10x. After the guard … 0/120 (0.00%) at 1x, 3/120
+(2.50%) at 10x," and its Positive consequence citing "South: reported=6 <=
+physical bound=10.54, evading S2" — both explicitly measured at demand 10x
+and reported as findings, not caveated as demonstration-only.
+
+Separately, this session's Phase A verified that S2's bound was itself
+miscalibrated: it used the Highway Capacity Manual's 1.9s real-world
+saturation headway to judge vehicle counts that this simulation's own
+car-following physics produced, not real traffic. Computed this session:
+sim_min_time_headway_s = MIN_GAP / (MAX_SPEED * 60) = 48 / (2.2*60) =
+0.3636s, against the HCM's 1.9s — a factor of 5.225. The specific recorded
+false positive from ADR-025 (green_s=9.917, discharged=7) exceeds the HCM
+bound (5.219, flagged) but not the simulation's own bound (27.27, not
+flagged): proof S2 was measuring the gap between simulation physics and
+real-world physics, not attacker activity.
+
+**Decision**
+
+Two corrections, recorded together because the second changes numbers the
+first must be read alongside.
+
+1. ADR-026's "no reported result … used a density multiplier other than
+1.0" is corrected to: no result in ADR-024 (the HOURLY_DEMAND/
+ANOMALY_RATE_MIN correction) used a density multiplier other than 1.0.
+ADR-025's S2 false-positive rates and its crude/stealthy evasion example
+were measured at demand 10x, and that was necessary, not incidental: at
+demand 1x, HOURLY_DEMAND (ADR-024) is low enough that within a review-sized
+observation window (single-digit sim-minutes) genuine discharge counts are
+usually zero or one. Both the S2 false-positive rate and the crude/stealthy
+evasion example need a representative sample of true_vehicles large enough
+to compare meaningfully against a green-time-derived bound — 10x reliably
+produces that sample within the review's time budget; 1x does not
+reliably produce it at all, not because the phenomenon is absent at 1x but
+because it is impractical to observe there in finite review time.
+DEMAND_LEVELS exists for exactly this reason (ADR-026's own Decision), so
+using it for ADR-025's measurements was the mechanism working as designed,
+not a violation of ADR-026's intent.
+
+2. security/detection.py's S2 IMPLAUSIBLE now takes sim_saturation_headway_s
+as a required parameter instead of using the HCM figure directly.
+traffic_sim.py computes SIM_SATURATION_HEADWAY_S = MIN_GAP / (MAX_SPEED *
+60) = 0.3636s and passes it at the Simulation._classify() call sites;
+detection.py stays import-free of traffic_sim by design, so the value is
+passed in rather than duplicated as a second literal that could silently
+drift from MIN_GAP/MAX_SPEED. HCM_SATURATION_HEADWAY_S (1.9s) is retained
+as a named constant, documented as the correct bound for a real deployment,
+just not what this simulation should be judged against.
+
+Measured before/after (this session, Review A1, headless, peak hour):
+false positive rate at demand 1x: 0.00% (unchanged, was already 0.00%
+after the Phase 1 guard). At demand 10x: 0.00%, down from the 2.50% (3/120)
+recorded in ADR-025. Crude injection (999) at demand 10x still fires S2
+(South: reported=999 against a new bound of 55.05). Stealthy injection at
+demand 10x still evades S2 (South: reported=6 against the same 55.05 bound
+— a wider margin than the 10.54 bound it evaded before), and the wider
+bound did not additionally let crude through: 999 remains far beyond 55.05.
+
+**Alternatives rejected**
+
+Editing ADR-025 or ADR-026 directly to remove the contradiction. Rejected:
+this project's own established convention (e.g. ADR-018 correcting
+ADR-015, ADR-021 amending ADR-006's status) is that ADRs are append-only:
+a later entry corrects or supersedes an earlier one's specific claim, it
+does not rewrite history. Neither ADR-025 nor ADR-026 was edited by this
+entry — confirmed via `git diff DECISIONS.md` showing insertions only.
+
+Re-measuring the S2 false-positive rate and the crude/stealthy example at
+demand 1x to make ADR-026's blanket claim literally true. Rejected: as
+argued above, 1x cannot reliably exercise the S2 boundary within a
+practical review window, so this would trade a real, useful measurement
+at 10x for a technically-1x-only but practically uninformative one, and
+would not actually fix the underlying imprecision in ADR-026's wording.
+
+Treating ADR-026's cited demand=1x/speed=50 framerate figure (commit
+9947df6) as confirmation that speed=50 has a real, repeatable framerate
+cost. Rejected: the same commit measured a HIGHER framerate at ten times
+the demand (more vehicles, more draw calls, faster result) — physically
+backwards if the number reflected a real cost rather than measurement
+noise from the headless SDL dummy-driver proxy. That figure is not
+restated here; ADR-026 readers should treat it as unreliable and
+unrepeated, not as a measured speed-dependent cost.
+
+**Consequences**
+
+Positive: ADR-026's claim now precisely matches what was actually measured
+where — a reader checking "was this number measured at real demand" has a
+correct answer to check against, rather than a blanket statement one
+paragraph away from its own exception. The S2 physics correction removes a
+real, measured source of false positives on genuine traffic at demand 10x
+(2.50% to 0.00%) without weakening true-positive detection: the crude
+attack (999) remains trivially caught under the new, wider bound, by two
+orders of magnitude.
+
+Negative: security/detection.py's compute_channel_signals signature grew a
+required parameter (sim_saturation_headway_s), which is a breaking change
+for any caller not updated alongside it — test_security.py's
+`_channel_signals` helper and two of its bound-dependent test assertions
+needed updating to the new bound (green=20s bound moved from ~10.5 to
+55.0; green=6s bound moved from ~3.16 to 16.5). Any future test written
+against the old HCM-derived bound values would now fail silently wrong
+rather than loudly — reviewers should check bound arithmetic against
+SIM_SATURATION_HEADWAY_S, not 1.9, when reading S2 test assertions from
+before this ADR.
+
+**Sources**
+
+Contradicting sentences: DECISIONS.md ADR-025 (Consequences section) and
+ADR-026 (Consequences section), re-read directly this session before
+writing this entry. Physics verification (0.3636s headway, 5.225 ratio,
+the green_s=9.917/discharged=7 bound comparison): computed this session
+per Phase A's instructions. Before/after false-positive rates and the
+crude/stealthy bound comparison at demand 10x: this session's Review A1,
+headless runs against the corrected security/detection.py and
+traffic_sim.py. Framerate noise observation: commit 9947df6, both cited
+figures read directly from its own commit message, not restated as new
+measurement.
