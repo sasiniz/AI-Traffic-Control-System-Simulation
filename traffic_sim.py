@@ -77,6 +77,35 @@ CY = HEIGHT // 2                 # 360
 ROAD_HALF = 70                   # half the road width, so each road is 140 wide
 LANE_OFFSET = 35                 # lane centre distance from the road centreline
 
+# Sensor channel panel (right dashboard) and its four buttons. Defined ONCE
+# here so the renderer and main()'s MOUSEBUTTONDOWN hit-testing read the same
+# rects - unlike the left panel's TRIGGER ACCIDENT / CLEAR ACCIDENT / CAMERAS
+# buttons, whose drawing y-values (300, 348, 396) and click hit-test ranges
+# are two independent hardcoded copies that can silently drift apart. Do not
+# replicate that here; do not "fix" the left panel in this same change.
+SEC_PANEL_X = SIM_X1 + 16        # 1036
+SEC_PANEL_Y = 380
+SEC_PANEL_W = 212
+SEC_PANEL_H = 210                # bottom = 590; ANOMALY STATUS starts at 600
+
+# A 2x2 grid of compact buttons, not four full-width 38px buttons: four
+# full-width buttons plus a title and a 5-row reading list do not fit in
+# ~210px of panel height. Two columns of two rows fits the buttons in ~66px,
+# leaving the rest for the title and reading list. See draw_dashboard.
+SEC_BTN_W = 92
+SEC_BTN_H = 30
+_sec_btn_col0 = SEC_PANEL_X + 10
+_sec_btn_col1 = _sec_btn_col0 + SEC_BTN_W + 8
+_sec_btn_row0 = SEC_PANEL_Y + 30
+_sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 6
+
+SEC_BUTTONS = {
+    "encryption":    pygame.Rect(_sec_btn_col0, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
+    "false_data":    pygame.Rect(_sec_btn_col1, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
+    "spoof":         pygame.Rect(_sec_btn_col0, _sec_btn_row1, SEC_BTN_W, SEC_BTN_H),
+    "clear_attacks": pygame.Rect(_sec_btn_col1, _sec_btn_row1, SEC_BTN_W, SEC_BTN_H),
+}
+
 # =============================================================================
 # SECTION 2 - TRAFFIC SIDE AND LANE POSITIONS
 # =============================================================================
@@ -1262,6 +1291,12 @@ class Renderer:
         pygame.draw.rect(self.screen, colour, (x, y, 188, 38), border_radius=5)
         self.text(label, x + 14, y + 11, self.f_small, C_TEXT)
 
+    def _sec_button(self, rect, label, colour):
+        """Draws into one of the shared SEC_BUTTONS rects (Section 1) -
+        the same rect main()'s MOUSEBUTTONDOWN handler hit-tests against."""
+        pygame.draw.rect(self.screen, colour, rect, border_radius=5)
+        self.text(label, rect.centerx, rect.centery, self.f_small, C_TEXT, centre=True)
+
     def draw_dashboard(self, sim):
         sc = self.screen
         pygame.draw.rect(sc, C_PANEL, (SIM_X1, 0, DASH_W, HEIGHT))
@@ -1286,21 +1321,25 @@ class Renderer:
         # signals do. Encryption state and the last few accept/reject
         # outcomes from sim.channel_log (populated in Simulation._maybe_log,
         # Section 13) - the visible proof that toggling E changes whether
-        # an active attack (F/G) succeeds, without restarting.
-        sec = pygame.Rect(SIM_X1 + 16, 380, 212, 210)
+        # an active attack (F/G) succeeds, without restarting. The four
+        # buttons below hit-test against the SAME SEC_BUTTONS rects main()
+        # uses for clicks - see the Section 1 comment on why that matters.
+        sec = pygame.Rect(SEC_PANEL_X, SEC_PANEL_Y, SEC_PANEL_W, SEC_PANEL_H)
         pygame.draw.rect(sc, C_CARD, sec, border_radius=5)
-        self.text("SENSOR CHANNEL", SIM_X1 + 30, 390, self.f_small, C_MUTED)
+        self.text("SENSOR CHANNEL", SEC_PANEL_X + 14, SEC_PANEL_Y + 10,
+                  self.f_small, C_MUTED)
 
         enc = sim.channel.encryption_enabled
-        self.text("ENCRYPTION  [E]", SIM_X1 + 30, 410, self.f_small, C_MUTED)
-        self.text("ON" if enc else "OFF", SIM_X1 + 30, 428,
-                  self.f_med, C_GREEN if enc else C_RED)
+        self._sec_button(SEC_BUTTONS["encryption"], "ENCRYPT [E]",
+                          C_GREEN if enc else C_RED)
+        self._sec_button(SEC_BUTTONS["false_data"], "FALSE DATA [F]", C_CARD)
+        self._sec_button(SEC_BUTTONS["spoof"], "SPOOF [G]", C_CARD)
+        self._sec_button(SEC_BUTTONS["clear_attacks"], "CLEAR [H]", C_CARD)
 
-        self.text("[F] false data  [G] spoof  [H] clear",
-                  SIM_X1 + 30, 454, self.f_small, C_MUTED)
-
-        self.text("RECENT READINGS", SIM_X1 + 30, 478, self.f_small, C_MUTED)
-        row_y = 496
+        readings_y = SEC_BUTTONS["clear_attacks"].bottom + 10
+        self.text("RECENT READINGS", SEC_PANEL_X + 14, readings_y,
+                  self.f_small, C_MUTED)
+        row_y = readings_y + 18
         for entry in sim.channel_log[:5]:
             if not entry["accepted"]:
                 self.text(f"{entry['arm']:<6}REJECTED", SIM_X1 + 30, row_y,
@@ -1394,6 +1433,17 @@ def main():
     sim = Simulation()
     renderer = Renderer(screen)
 
+    # Shared by the E/F/G/H key handlers and the SEC_BUTTONS mouse handler
+    # below, so keyboard and mouse trigger the exact same action - one
+    # source of truth, same reasoning as SEC_BUTTONS itself (Section 1).
+    sec_actions = {
+        "encryption": lambda: setattr(sim.channel, "encryption_enabled",
+                                       not sim.channel.encryption_enabled),
+        "false_data": lambda: sim.channel.add_interceptor(FalseDataInjectionAttack()),
+        "spoof": lambda: sim.channel.add_interceptor(SensorSpoofingAttack()),
+        "clear_attacks": lambda: sim.channel.clear_interceptors(),
+    }
+
     accident_mode = False
     camera_on = False
     paused = False
@@ -1425,13 +1475,13 @@ def main():
                 elif event.key == pygame.K_3:
                     speed = 4.0
                 elif event.key == pygame.K_e:
-                    sim.channel.encryption_enabled = not sim.channel.encryption_enabled
+                    sec_actions["encryption"]()
                 elif event.key == pygame.K_f:
-                    sim.channel.add_interceptor(FalseDataInjectionAttack())
+                    sec_actions["false_data"]()
                 elif event.key == pygame.K_g:
-                    sim.channel.add_interceptor(SensorSpoofingAttack())
+                    sec_actions["spoof"]()
                 elif event.key == pygame.K_h:
-                    sim.channel.clear_interceptors()
+                    sec_actions["clear_attacks"]()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if camera_on:
@@ -1446,6 +1496,11 @@ def main():
                         sim.clear_accident()
                     elif 396 <= my <= 434:
                         camera_on = not camera_on
+                elif mx >= SIM_X1:
+                    for name, rect in SEC_BUTTONS.items():
+                        if rect.collidepoint(mx, my):
+                            sec_actions[name]()
+                            break
 
         if not paused:
             sim.update(dt * speed)
