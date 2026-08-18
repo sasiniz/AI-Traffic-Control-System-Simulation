@@ -296,17 +296,21 @@ def _load_signal_timeline(path):
     return phases
 
 
-# Approximate arrivals per hour per arm, by hour of day.
-# This is a placeholder for traffic_final_cleaned.csv.
+# Arrivals per hour per arm, by hour of day. Real demand: mean Vehicles per
+# (Road, hour-of-day) across the full data/traffic_final_cleaned.csv, rounded
+# to the nearest vehicle. Verified independently against the dataset before
+# use (grouped by road+hour, mean, round) - exact match, no discrepancy.
+# Replaces the earlier fabricated placeholder (North peaked at 780 vs a real
+# mean of ~57; see Phase 0 commit message for the full before/after).
 HOURLY_DEMAND = {
-    "North": [90, 60, 40, 35, 45, 120, 300, 620, 780, 540, 400, 380,
-              430, 420, 400, 450, 600, 760, 690, 500, 360, 260, 180, 120],
-    "South": [80, 55, 38, 32, 42, 110, 280, 560, 700, 500, 380, 360,
-              410, 400, 380, 430, 560, 700, 640, 470, 340, 250, 170, 110],
-    "East":  [60, 40, 28, 25, 33, 85, 200, 400, 520, 380, 300, 290,
-              320, 310, 300, 340, 430, 530, 480, 360, 260, 190, 130, 85],
-    "West":  [65, 44, 30, 26, 35, 90, 210, 420, 540, 400, 310, 300,
-              330, 320, 310, 350, 450, 550, 500, 375, 270, 195, 135, 90],
+    "North": [46, 39, 34, 29, 26, 24, 26, 30, 33, 39, 50, 56,
+              57, 51, 55, 54, 52, 52, 55, 59, 57, 55, 53, 50],
+    "South": [16, 14, 13, 11, 10,  9,  9, 10, 11, 12, 13, 15,
+              16, 15, 16, 17, 16, 16, 17, 18, 18, 17, 17, 16],
+    "East":  [14, 10,  8,  7,  6,  6,  6,  8,  9, 11, 15, 17,
+              18, 16, 18, 17, 17, 17, 18, 19, 20, 19, 17, 16],
+    "West":  [ 7,  6,  5,  4,  4,  4,  4,  5,  5,  6,  8,  9,
+              11,  9,  9,  9,  9,  9,  8,  9,  9,  8,  9,  8],
 }
 
 START_HOUR = 8                   # simulation clock starts at 08:00
@@ -317,9 +321,48 @@ START_HOUR = 8                   # simulation clock starts at 08:00
 
 WINDOW_S = 20.0                  # rolling window used for anomaly checks
 QUEUE_SPEED_THRESHOLD = 0.4      # below this a vehicle counts as queueing
+
+# ANOMALY_QUEUE_MIN was tuned against the old, fabricated HOURLY_DEMAND
+# (North peaking at 780/hr). At the corrected real demand (North peaking at
+# ~59/hr) it essentially never fires: measured across 90 sim-minutes headless
+# (30 min default-hour no accident, 30 min peak-hour no accident, 60 min
+# peak-hour WITH a real accident on North from t=60s) - zero frames anywhere
+# reached queue_len >= 5. Max queue observed, including during the hour-long
+# accident, was 4. This is a dataset finding, not a bug: real demand runs far
+# below saturation (busiest single hour across all four approaches is 353
+# vehicles; degree of saturation ~0.25), so a 5-vehicle physical queue is a
+# rare event this simulation's real-demand regime may not produce at all.
+# Left unchanged - only ANOMALY_RATE_MIN was in scope to recalibrate (see
+# below) - but recorded here so a future change is not made blind.
 ANOMALY_QUEUE_MIN = 5            # a queue must exist before anything is odd
 ANOMALY_MIN_GREEN_S = 6.0        # need enough green time to judge fairly
-ANOMALY_RATE_MIN = 0.22          # vehicles discharged per second OF GREEN
+
+# Recalibrated against real demand (see HOURLY_DEMAND above), not the old
+# fabricated levels 0.22 was tuned against. Measured headless, peak hour
+# (North=59/hr), WINDOW_S=20s trailing rate = discharges / green_s:
+#   "normal, any queue present, green available": 717 qualifying frames over
+#     30 sim-min, rate = 0.0000 for EVERY one of them (min=p50=p90=max=0.0).
+#     At the production gate (queue_len >= ANOMALY_QUEUE_MIN = 5) there were
+#     ZERO qualifying frames at all - see the ANOMALY_QUEUE_MIN comment above.
+#   "accident-induced blockage on North, any queue present, green available,
+#     accident active": 31885 qualifying frames over 60 sim-min (accident
+#     placed at t=60s), rate min=0.0, p10=0.0, median=0.0999, p90=0.15,
+#     max=0.2198.
+# HONEST LIMITATION: these two distributions are NOT cleanly separable by
+# rate alone at real demand - the "normal" distribution is degenerate (always
+# exactly 0.0, because a real queue is so rare and brief that the 20s window
+# usually contains no discharges yet regardless of health), while blockage
+# frames, being far more numerous and persistent, actually show a HIGHER
+# typical rate than the rare normal frames. In other words: at real demand,
+# ANOMALY_QUEUE_MIN=5 is doing all of the false-positive prevention, not this
+# constant - "sits clearly below normal but above blockage" could not be
+# satisfied because normal and blockage overlap at rate 0.0. Chosen value:
+# the empirical CDF of the blockage distribution shows threshold 0.15 flags
+# 88.7% of blockage frames as anomalous (0.10 flags 50.2%, 0.05 flags 29.5%,
+# 0.02 flags 27.2%) while staying clearly under the observed blockage max of
+# 0.2198, so a genuine sustained blockage is very likely to be flagged once
+# the queue gate is ever satisfied, without flagging literally every frame.
+ANOMALY_RATE_MIN = 0.15          # vehicles discharged per second OF GREEN
 
 ENABLE_LOGGING = True
 LOG_PATH = "sensor_log.csv"
