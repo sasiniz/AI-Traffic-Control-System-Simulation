@@ -41,6 +41,9 @@ CONTROLS
     F            inject false data attack on the sensor channel
     G            inject sensor spoofing attack on the sensor channel
     H            clear active sensor channel attacks
+    S            toggle stealthy magnitude mode for the next F attack
+    K            toggle key-compromise mode for the next F/G attack
+    D            toggle demo demand multiplier (x10, NOT real demand)
     ESC          quit
 """
 
@@ -55,6 +58,7 @@ from security.crypto import SensorCrypto
 from security.channel import SensorChannel, ChannelRejected
 from security.attacks import FalseDataInjectionAttack, SensorSpoofingAttack
 from security.auth import OperatorAuth  # noqa: F401 - not wired in yet, see Section 13
+from security import detection as threat_detection
 
 # =============================================================================
 # SECTION 1 - LAYOUT CONSTANTS
@@ -88,22 +92,38 @@ SEC_PANEL_Y = 380
 SEC_PANEL_W = 212
 SEC_PANEL_H = 210                # bottom = 590; ANOMALY STATUS starts at 600
 
-# A 2x2 grid of compact buttons, not four full-width 38px buttons: four
-# full-width buttons plus a title and a 5-row reading list do not fit in
-# ~210px of panel height. Two columns of two rows fits the buttons in ~66px,
-# leaving the rest for the title and reading list. See draw_dashboard.
+# A 2-column grid of compact buttons, not full-width 38px buttons: seven
+# full-width buttons plus a title and a reading list do not fit in ~210px
+# of panel height. Three rows of two columns plus one full-width row (the
+# DEMO button) fits in ~138px, leaving the rest for the title and reading
+# list - now down to whatever fits dynamically (see draw_dashboard), since
+# a fourth button row leaves very little room. SEC_PANEL_H (this panel's
+# own height) is unchanged and the THREAT STATUS box below still starts at
+# a fixed y=600 - the new row is absorbed by shrinking the reading list,
+# not by growing this panel downward into that box.
 SEC_BTN_W = 92
 SEC_BTN_H = 30
 _sec_btn_col0 = SEC_PANEL_X + 10
 _sec_btn_col1 = _sec_btn_col0 + SEC_BTN_W + 8
 _sec_btn_row0 = SEC_PANEL_Y + 30
 _sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 6
+_sec_btn_row2 = _sec_btn_row1 + SEC_BTN_H + 6
+_sec_btn_row3 = _sec_btn_row2 + SEC_BTN_H + 6
 
 SEC_BUTTONS = {
     "encryption":    pygame.Rect(_sec_btn_col0, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
     "false_data":    pygame.Rect(_sec_btn_col1, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
     "spoof":         pygame.Rect(_sec_btn_col0, _sec_btn_row1, SEC_BTN_W, SEC_BTN_H),
     "clear_attacks": pygame.Rect(_sec_btn_col1, _sec_btn_row1, SEC_BTN_W, SEC_BTN_H),
+    # Mode toggles: change how the NEXT press of false_data/spoof builds its
+    # attack object (see main()'s sec_actions), rather than firing an attack
+    # themselves.
+    "toggle_stealth":       pygame.Rect(_sec_btn_col0, _sec_btn_row2, SEC_BTN_W, SEC_BTN_H),
+    "toggle_key_compromise": pygame.Rect(_sec_btn_col1, _sec_btn_row2, SEC_BTN_W, SEC_BTN_H),
+    # Demo-only demand scaling (see DEMAND_MULTIPLIER above) - full width,
+    # its own row, extending the same computed-offset pattern as the rows
+    # above rather than a new hardcoded rect.
+    "demo": pygame.Rect(_sec_btn_col0, _sec_btn_row3, SEC_BTN_W * 2 + 8, SEC_BTN_H),
 }
 
 # =============================================================================
@@ -314,6 +334,18 @@ HOURLY_DEMAND = {
 }
 
 START_HOUR = 8                   # simulation clock starts at 08:00
+
+# Presentation parameter only. 1.0 is real dataset demand (HOURLY_DEMAND
+# above, verified against data/traffic_final_cleaned.csv - see Phase 0).
+# Any value != 1.0 must NEVER be used to produce a reported result - it
+# exists solely so a demo can show physical-signal (S5) behaviour that
+# real demand structurally cannot reach: pinch capacity at CRAWL_SPEED is
+# 450 veh/h against a peak real arm demand of 59 veh/h, so a lane blockage
+# cannot build a persistent queue at multiplier 1.0 (see DECISIONS.md /
+# this session's Phase 0 report for the arithmetic). Toggled live via the
+# D key; never edit this constant to "make a demo work".
+DEMAND_MULTIPLIER = 1.0
+DEMO_MULTIPLIER_PRESET = 10.0     # value the D key toggles to
 
 # =============================================================================
 # SECTION 6 - SENSOR AND ANOMALY CONSTANTS
@@ -920,6 +952,29 @@ class Simulation:
         self.channel = SensorChannel(crypto=SensorCrypto(), encryption_enabled=True)
         self.channel_log = []              # most-recent-first, capped at CHANNEL_LOG_CAP
 
+        # Attack magnitude/key mode toggles (dashboard STEALTH / KEY COMP
+        # buttons, or S/K keys). These do not themselves attack anything -
+        # they change how the NEXT false_data/spoof press builds its attack
+        # object. See main()'s sec_actions.
+        self.attack_stealthy = False
+        self.attack_key_compromise = False
+
+        # Threat classification (security/detection.py): combines the
+        # channel's verdict on each reading with SensorSystem's existing
+        # physical rule to label what the dashboard operator sees. Pure
+        # functions in, plain dict out - see _classify() below. Read by
+        # the dashboard only; nothing that reads self.classification feeds
+        # back into signals, vehicles, or sensors (DESIGN RULE 1).
+        self.classification = {
+            a: threat_detection.ClassificationResult(threat_detection.CLASSIFICATION_NORMAL)
+            for a in ARMS
+        }
+
+        # Presentation-only demand scaling (see DEMAND_MULTIPLIER above).
+        # An instance attribute, not just the module constant, so the D key
+        # can toggle it live without touching module state.
+        self.demand_multiplier = DEMAND_MULTIPLIER
+
     # -- clock --------------------------------------------------------------
     @property
     def hour(self):
@@ -931,7 +986,7 @@ class Simulation:
 
     # -- spawning -----------------------------------------------------------
     def _spawn_probability(self, arm, dt):
-        per_hour = HOURLY_DEMAND[arm][self.hour]
+        per_hour = HOURLY_DEMAND[arm][self.hour] * self.demand_multiplier
         return (per_hour / 3600.0) * dt
 
     def _lane_is_clear_at_entry(self, route):
@@ -1072,6 +1127,7 @@ class Simulation:
 
         self.sensors.update(self.sim_time, self.vehicles)
         self._maybe_log()
+        self._classify()
 
     # -- accident control ---------------------------------------------------
     def place_accident(self, mx, my):
@@ -1140,26 +1196,88 @@ class Simulation:
             # updates channel_log for the dashboard; it is never merged
             # back into log_rows and never touches self.sensors, so the
             # anomaly detector and sensor_log.csv are unaffected by it.
-            self._send_channel_reading(arm, discharged)
+            self._send_channel_reading(arm, discharged, self.sensors.green_s[arm])
 
-    def _send_channel_reading(self, arm, vehicles):
+    def _send_channel_reading(self, arm, vehicles, green_seconds_window):
+        # sim_time groups readings from the same _maybe_log tick together -
+        # security/detection.py's S4 simultaneity signal needs to know
+        # which readings arrived in the same interval. encryption_enabled
+        # is captured per-reading (not read live later) because it can be
+        # toggled live by the E key between ticks.
+        base = {
+            "arm": arm,
+            "sim_time": round(self.sim_time, 1),
+            "encryption_enabled": self.channel.encryption_enabled,
+            "true_vehicles": vehicles,
+            "green_seconds_window": green_seconds_window,
+        }
         try:
             event = self.channel.send_and_receive({"road": arm, "vehicles": vehicles})
             self.channel_log.insert(0, {
-                "arm": arm,
+                **base,
                 "accepted": True,
                 "reason": event.reason,
                 "reported_road": event.plaintext.get("road"),
                 "reported_vehicles": event.plaintext.get("vehicles"),
-                "true_vehicles": vehicles,
             })
         except ChannelRejected as exc:
             self.channel_log.insert(0, {
-                "arm": arm,
+                **base,
                 "accepted": False,
                 "reason": str(exc),
+                "reported_road": None,
+                "reported_vehicles": None,
             })
         del self.channel_log[CHANNEL_LOG_CAP:]
+
+    # -- threat classification (security/detection.py) ----------------------
+    def _classify(self):
+        """Combine the channel's verdict (S1-S3, S4) with SensorSystem's
+        existing physical rule (S5, self.sensors.anomaly) into a
+        per-arm classification for the dashboard. Reads self.channel_log
+        and self.sensors; writes only self.classification, which nothing
+        in SignalController, Vehicle, or _leaders ever reads - see
+        DESIGN RULE 1 at the top of this file.
+
+        S5 is recomputed every call (self.sensors.anomaly is fresh every
+        frame). S1-S4 reflect the most recent channel reading per arm,
+        which only changes once every LOG_INTERVAL_S (10s) - between
+        ticks they simply hold their last value, the same way a real
+        dashboard would keep showing the last received reading.
+        """
+        current_tick = self.channel_log[0]["sim_time"] if self.channel_log else None
+        this_tick_entries = [e for e in self.channel_log if e["sim_time"] == current_tick]
+        channel_signals_by_arm = {
+            e["arm"]: threat_detection.compute_channel_signals(
+                accepted=e["accepted"],
+                encryption_enabled=e["encryption_enabled"],
+                reported_vehicles=e["reported_vehicles"],
+                true_vehicles=e["true_vehicles"],
+                green_seconds_window=e["green_seconds_window"],
+            )
+            for e in this_tick_entries
+        }
+        simultaneity = threat_detection.simultaneity_flag(channel_signals_by_arm)
+
+        results = {}
+        for arm in ARMS:
+            if arm in channel_signals_by_arm:
+                channel_signals = channel_signals_by_arm[arm]
+            else:
+                # No channel reading has arrived for this arm yet (first
+                # LOG_INTERVAL_S of a fresh run) - only S5 can evaluate.
+                channel_signals = threat_detection.compute_channel_signals(
+                    accepted=True, encryption_enabled=self.channel.encryption_enabled,
+                    reported_vehicles=None, true_vehicles=0,
+                    green_seconds_window=self.sensors.green_s[arm],
+                )
+            results[arm] = threat_detection.classify(
+                channel=channel_signals,
+                physical_anomaly=self.sensors.anomaly[arm],
+                simultaneity=simultaneity,
+                accident_active=self.accident is not None,
+            )
+        self.classification = results
 
     def write_log(self, path=LOG_PATH):
         if not self.log_rows:
@@ -1191,6 +1309,24 @@ class Renderer:
         else:
             rect.topleft = (x, y)
         self.screen.blit(surf, rect)
+
+    def wrap_text(self, s, font, max_width):
+        """Greedy word-wrap: splits s into lines no wider than max_width
+        under font. Used by the THREAT STATUS box, whose classification/
+        signal/action strings are longer than the 212px dashboard column."""
+        words = str(s).split(" ")
+        lines = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if font.size(candidate)[0] <= max_width or not current:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
 
     # -- junction -----------------------------------------------------------
     def draw_junction(self, sim, accident_mode):
@@ -1230,6 +1366,18 @@ class Renderer:
             pygame.draw.rect(sc, C_RED, (SIM_X0, 0, SIM_W, HEIGHT), 3)
             self.text("ACCIDENT MODE - click a road to place", CX, 22,
                       self.f_title, C_RED, centre=True)
+
+        # Demo-only demand scaling (DEMAND_MULTIPLIER, Section 5). Drawn
+        # LAST, on top of everything else in the simulation zone including
+        # the accident-mode banner above, and as a solid filled bar (not
+        # just a border) specifically so it cannot be cropped out of a
+        # screenshot of the junction without also cropping out the traffic
+        # the screenshot is presumably trying to show.
+        if sim.demand_multiplier != 1.0:
+            banner_h = 34
+            pygame.draw.rect(sc, C_AMBER, (SIM_X0, 0, SIM_W, banner_h))
+            self.text(f"DEMO DENSITY x{sim.demand_multiplier:g} - NOT REAL DEMAND",
+                      CX, banner_h // 2, self.f_title, C_BG, centre=True)
 
         sc.set_clip(None)
 
@@ -1340,6 +1488,35 @@ class Renderer:
         pygame.draw.rect(self.screen, colour, rect, border_radius=5)
         self.text(label, rect.centerx, rect.centery, self.f_small, C_TEXT, centre=True)
 
+    # Display-only severity order for picking ONE state to headline in the
+    # THREAT STATUS box when different arms classify differently. Does not
+    # affect security/detection.py's own per-arm classify() priority chain
+    # - that ordering is unrelated and already fixed.
+    _DASHBOARD_SEVERITY = [
+        threat_detection.CLASSIFICATION_CYBER_CONFIRMED,
+        threat_detection.CLASSIFICATION_CYBER_LIKELY,
+        threat_detection.CLASSIFICATION_AMBIGUOUS,
+        threat_detection.CLASSIFICATION_PHYSICAL_INCIDENT,
+        threat_detection.CLASSIFICATION_NORMAL,
+    ]
+
+    def _worst_classification(self, classification_by_arm):
+        """Picks the single most severe classification present across all
+        four arms' results (_DASHBOARD_SEVERITY order), the arms that share
+        it, and the union of signals those arms fired - so the small
+        THREAT STATUS box has one coherent story to tell instead of trying
+        to show four independent verdicts at once."""
+        present = {r.classification for r in classification_by_arm.values()}
+        worst = next(c for c in self._DASHBOARD_SEVERITY if c in present)
+        arms = [a for a, r in classification_by_arm.items() if r.classification == worst]
+        signals = []
+        for a in arms:
+            for s in classification_by_arm[a].signals:
+                if s not in signals:
+                    signals.append(s)
+        example = classification_by_arm[arms[0]]
+        return worst, arms, signals, example.confidence, example.action
+
     def draw_dashboard(self, sim):
         sc = self.screen
         pygame.draw.rect(sc, C_PANEL, (SIM_X1, 0, DASH_W, HEIGHT))
@@ -1378,14 +1555,31 @@ class Renderer:
         self._sec_button(SEC_BUTTONS["false_data"], "FALSE DATA [F]", C_CARD)
         self._sec_button(SEC_BUTTONS["spoof"], "SPOOF [G]", C_CARD)
         self._sec_button(SEC_BUTTONS["clear_attacks"], "CLEAR [H]", C_CARD)
+        # Mode toggles (security/attacks.py 1a/1b): change what the NEXT
+        # false_data/spoof press builds, so they get their own on/off
+        # colour rather than the plain C_CARD of the fire-once buttons.
+        self._sec_button(SEC_BUTTONS["toggle_stealth"], "STEALTH [S]",
+                          C_AMBER if sim.attack_stealthy else C_CARD)
+        self._sec_button(SEC_BUTTONS["toggle_key_compromise"], "KEY COMP [K]",
+                          C_RED if sim.attack_key_compromise else C_CARD)
+        # Demo-only demand scaling (DEMAND_MULTIPLIER, Section 5) - amber
+        # while active, matching the banner colour in draw_junction so the
+        # same "not real demand" state reads consistently everywhere.
+        demo_active = sim.demand_multiplier != 1.0
+        self._sec_button(SEC_BUTTONS["demo"], "DEMO x10 [D]",
+                          C_AMBER if demo_active else C_CARD)
 
-        readings_y = SEC_BUTTONS["clear_attacks"].bottom + 10
+        readings_y = SEC_BUTTONS["demo"].bottom + 8
         self.text("RECENT READINGS", SEC_PANEL_X + 14, readings_y,
                   self.f_small, C_MUTED)
-        row_y = readings_y + 18
-        for entry in sim.channel_log[:5]:
+        row_y = readings_y + 16
+        # Dynamic, not a hardcoded slice: the DEMO row leaves less room
+        # than before, and this adapts if panel dimensions ever change.
+        panel_bottom = SEC_PANEL_Y + SEC_PANEL_H
+        max_rows = max(1, (panel_bottom - 6 - row_y) // 17)
+        for entry in sim.channel_log[:max_rows]:
             if not entry["accepted"]:
-                self.text(f"{entry['arm']:<6}REJECTED", SIM_X1 + 30, row_y,
+                self.text(f"{entry['arm']:<6}REJECTED", SEC_PANEL_X + 14, row_y,
                           self.f_small, C_RED)
                 row_y += 17
                 continue
@@ -1406,26 +1600,51 @@ class Renderer:
             else:
                 label = f"{arm:<6}{reported_vehicles}"
                 colour = C_MUTED
-            self.text(label, SIM_X1 + 30, row_y, self.f_small, colour)
+            self.text(label, SEC_PANEL_X + 14, row_y, self.f_small, colour)
             row_y += 17
 
-        # Anomaly summary.
-        box = pygame.Rect(SIM_X1 + 16, 600, 212, 82)
-        active = sim.sensors.any_anomaly()
-        pygame.draw.rect(sc, C_RED if active else C_CARD, box, border_radius=5)
-        self.text("ANOMALY STATUS", SIM_X1 + 30, 610, self.f_small,
-                  C_WHITE if active else C_MUTED)
-        if active:
-            arms = ", ".join(sim.sensors.anomaly_arms())
-            self.text("flow collapse on green", SIM_X1 + 30, 630, self.f_med, C_WHITE)
-            self.text(arms, SIM_X1 + 30, 650, self.f_small, C_WHITE)
-        else:
-            self.text("none detected", SIM_X1 + 30, 632, self.f_med, C_TEXT)
+        # Threat status: security/detection.py's classification, not the
+        # raw SensorSystem rule any more. Picks the single most severe
+        # verdict across the four arms (see _worst_classification) so this
+        # box tells one coherent story. Colour-coded by class; AMBIGUOUS
+        # explicitly names the camera check, since that is the designed
+        # human-in-the-loop decision point (security/detection.py's
+        # AMBIGUOUS action string already says so - just displayed here).
+        box = pygame.Rect(SIM_X1 + 16, 600, 212, 110)
+        worst, arms, signals, _confidence, action = self._worst_classification(sim.classification)
+        box_colour = {
+            threat_detection.CLASSIFICATION_CYBER_CONFIRMED: C_RED,
+            threat_detection.CLASSIFICATION_CYBER_LIKELY: C_RED,
+            threat_detection.CLASSIFICATION_AMBIGUOUS: C_AMBER,
+            threat_detection.CLASSIFICATION_PHYSICAL_INCIDENT: C_BLUE,
+            threat_detection.CLASSIFICATION_NORMAL: C_CARD,
+        }[worst]
+        pygame.draw.rect(sc, box_colour, box, border_radius=5)
+        text_colour = C_MUTED if worst == threat_detection.CLASSIFICATION_NORMAL else C_WHITE
 
-        if sim.accident is not None:
+        self.text("THREAT STATUS", SIM_X1 + 30, 608, self.f_small, text_colour)
+        self.text(worst, SIM_X1 + 30, 626, self.f_med, text_colour)
+
+        line_y = 646
+        if worst != threat_detection.CLASSIFICATION_NORMAL:
+            self.text(", ".join(arms), SIM_X1 + 30, line_y, self.f_small, text_colour)
+            line_y += 16
+            if signals:
+                # One wrapped line only - box height is fixed (bottom=710)
+                # and the action string below needs guaranteed room too.
+                first_line = self.wrap_text(", ".join(signals), self.f_small, 184)[0]
+                self.text(first_line, SIM_X1 + 30, line_y, self.f_small, text_colour)
+                line_y += 15
+            for line in self.wrap_text(action, self.f_small, 184)[:2]:
+                self.text(line, SIM_X1 + 30, line_y, self.f_small, text_colour)
+                line_y += 15
+        else:
+            self.text("no signals fired", SIM_X1 + 30, line_y, self.f_small, text_colour)
+            line_y += 16
+
+        if sim.accident is not None and line_y <= 700:
             self.text(f"incident: {sim.accident.label()}",
-                      SIM_X1 + 30, 668, self.f_small,
-                      C_WHITE if active else C_MUTED)
+                      SIM_X1 + 30, line_y, self.f_small, text_colour)
 
     # -- camera overlay -----------------------------------------------------
     def draw_cameras(self, sim):
@@ -1476,15 +1695,34 @@ def main():
     sim = Simulation()
     renderer = Renderer(screen)
 
-    # Shared by the E/F/G/H key handlers and the SEC_BUTTONS mouse handler
-    # below, so keyboard and mouse trigger the exact same action - one
-    # source of truth, same reasoning as SEC_BUTTONS itself (Section 1).
+    # Shared by the E/F/G/H/S/K key handlers and the SEC_BUTTONS mouse
+    # handler below, so keyboard and mouse trigger the exact same action -
+    # one source of truth, same reasoning as SEC_BUTTONS itself (Section 1).
+    # false_data/spoof read sim.attack_stealthy / sim.attack_key_compromise
+    # at PRESS time, so toggling STEALTH or KEY COMP changes what the next
+    # press builds without altering any attack already in interceptors.
+    def _make_false_data_attack():
+        return FalseDataInjectionAttack(
+            mode="stealthy" if sim.attack_stealthy else "crude",
+            crypto=sim.channel.crypto if sim.attack_key_compromise else None,
+        )
+
+    def _make_spoof_attack():
+        return SensorSpoofingAttack(
+            crypto=sim.channel.crypto if sim.attack_key_compromise else None,
+        )
+
     sec_actions = {
         "encryption": lambda: setattr(sim.channel, "encryption_enabled",
                                        not sim.channel.encryption_enabled),
-        "false_data": lambda: sim.channel.add_interceptor(FalseDataInjectionAttack()),
-        "spoof": lambda: sim.channel.add_interceptor(SensorSpoofingAttack()),
+        "false_data": lambda: sim.channel.add_interceptor(_make_false_data_attack()),
+        "spoof": lambda: sim.channel.add_interceptor(_make_spoof_attack()),
         "clear_attacks": lambda: sim.channel.clear_interceptors(),
+        "toggle_stealth": lambda: setattr(sim, "attack_stealthy", not sim.attack_stealthy),
+        "toggle_key_compromise": lambda: setattr(sim, "attack_key_compromise",
+                                                   not sim.attack_key_compromise),
+        "demo": lambda: setattr(sim, "demand_multiplier",
+                                 DEMO_MULTIPLIER_PRESET if sim.demand_multiplier == 1.0 else 1.0),
     }
 
     accident_mode = False
@@ -1525,6 +1763,12 @@ def main():
                     sec_actions["spoof"]()
                 elif event.key == pygame.K_h:
                     sec_actions["clear_attacks"]()
+                elif event.key == pygame.K_s:
+                    sec_actions["toggle_stealth"]()
+                elif event.key == pygame.K_k:
+                    sec_actions["toggle_key_compromise"]()
+                elif event.key == pygame.K_d:
+                    sec_actions["demo"]()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if camera_on:
