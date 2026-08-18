@@ -249,6 +249,28 @@ def test_detection_s2_implausible_uses_saturation_headway():
     assert just_under.s2_implausible is False
 
 
+def test_detection_s2_does_not_fire_below_min_green_guard():
+    # Sub-second green window: bound < 1, so even a single genuine
+    # discharge (carried over from a previous, misaligned green phase)
+    # would trip S2 without the S2_MIN_GREEN_S guard. Regression test for
+    # the Phase 1 false-positive fix.
+    assert detection.S2_MIN_GREEN_S == 6.0
+    below_guard = _channel_signals(reported_vehicles=1, true_vehicles=1,
+                                    green_seconds_window=0.65)
+    assert below_guard.s2_implausible is False, \
+        "below S2_MIN_GREEN_S, S2 must not evaluate at all - even a genuine reading would trip it"
+
+    # At the guard boundary (green == 6.0 exactly), S2 DOES evaluate:
+    # bound = 6.0/1.9 = 3.16, so 3 is plausible and 4 is not.
+    at_guard_plausible = _channel_signals(reported_vehicles=3, true_vehicles=3,
+                                           green_seconds_window=6.0)
+    at_guard_implausible = _channel_signals(reported_vehicles=4, true_vehicles=4,
+                                             green_seconds_window=6.0)
+    assert at_guard_plausible.s2_implausible is False
+    assert at_guard_implausible.s2_implausible is True, \
+        "at the guard boundary S2 must still evaluate and can still fire"
+
+
 def test_detection_s3_divergence_any_nonzero_difference():
     same = _channel_signals(reported_vehicles=5, true_vehicles=5)
     different = _channel_signals(reported_vehicles=6, true_vehicles=5)
@@ -357,6 +379,7 @@ ALL_TESTS = [
     test_sensor_spoofing_with_stolen_key_passes_encryption,
     test_detection_s1_fires_only_when_rejected_and_encrypted,
     test_detection_s2_implausible_uses_saturation_headway,
+    test_detection_s2_does_not_fire_below_min_green_guard,
     test_detection_s3_divergence_any_nonzero_difference,
     test_detection_s3_and_s2_do_not_fire_on_rejected_messages,
     test_detection_simultaneity_requires_three_or_more_arms,

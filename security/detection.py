@@ -32,7 +32,9 @@ THE FIVE SIGNALS
                       Manual value already used for MIN_GREEN_TO_START in
                       traffic_sim.py (see DECISIONS.md ADR-006 and
                       ADR-021) - derived from that existing citation, not
-                      invented here.
+                      invented here. Does not evaluate at all below
+                      S2_MIN_GREEN_S (6.0s) of green in the window - see
+                      that constant's comment for why.
   S3 DIVERGENCE       the reported value differs from the true value that
                       was actually sent into the channel. See the
                       CRITICAL HONESTY REQUIREMENT below before trusting
@@ -121,6 +123,27 @@ SATURATION_HEADWAY_S = 1.9
 # correct value in this architecture, not a rounded-off guess.
 DIVERGENCE_THRESHOLD_VEHICLES = 0
 
+# S2 must not evaluate at all below this much green time in the window.
+# Mirrors ANOMALY_MIN_GREEN_S = 6.0 in traffic_sim.py (Section 6, the
+# existing SensorSystem physical rule) rather than inventing a second,
+# independent number for the same underlying judgement - "is there enough
+# green time in this window to judge fairly".
+#
+# Mechanism, not just a threshold: S2's bound is green_s / SATURATION_
+# HEADWAY_S. Below ~1.9s of green the bound drops under 1 vehicle, so ANY
+# discharge counted in the reading trips S2 - and that discharge is very
+# often real, carried over from a green phase that started just before the
+# 20s rolling window began. discharges and green_seconds_window are both
+# rolling-windowed independently and are not phase-aligned to each other:
+# a vehicle can be counted as "discharged in the last 20s" while almost
+# none of the green time that let it through falls inside that same 20s
+# slice. The root cause is that misalignment, not the choice of threshold
+# value - raising S2_MIN_GREEN_S papers over it without fixing it, so this
+# guard is deliberately set to the same figure already trusted elsewhere
+# in the codebase for "enough green to judge fairly", not tuned separately
+# to make false positives disappear.
+S2_MIN_GREEN_S = 6.0
+
 # Given directly by the classification design (see module docstring S4):
 # "three or more arms flagged in the same interval". Not derived from
 # data - it is a definition, the same way "S5 requires 3+ signals" would
@@ -189,7 +212,7 @@ def compute_channel_signals(
     """
     s1 = (not accepted) and encryption_enabled
 
-    if accepted and reported_vehicles is not None and green_seconds_window > 0:
+    if accepted and reported_vehicles is not None and green_seconds_window >= S2_MIN_GREEN_S:
         physical_bound = green_seconds_window / SATURATION_HEADWAY_S
         s2 = reported_vehicles > physical_bound
     else:
