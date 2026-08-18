@@ -37,6 +37,10 @@ CONTROLS
     C            toggle the observer camera overlay
     SPACE        pause / resume
     1 2 3        simulation speed 1x / 2x / 4x
+    E            toggle sensor channel encryption on/off
+    F            inject false data attack on the sensor channel
+    G            inject sensor spoofing attack on the sensor channel
+    H            clear active sensor channel attacks
     ESC          quit
 """
 
@@ -46,6 +50,11 @@ import os
 import random
 
 import pygame
+
+from security.crypto import SensorCrypto
+from security.channel import SensorChannel, ChannelRejected
+from security.attacks import FalseDataInjectionAttack, SensorSpoofingAttack
+from security.auth import OperatorAuth  # noqa: F401 - not wired in yet, see Section 13
 
 # =============================================================================
 # SECTION 1 - LAYOUT CONSTANTS
@@ -225,7 +234,7 @@ def _bezier_length(p0, c, p2, samples=16):
 # by generate_timeline.py's compile_timeline(). Each row is one phase: a
 # road, its green seconds, and its amber seconds, laid out so every hour of
 # real schedule sums to exactly 3600 seconds. When the Random Forest
-# scheduler is ready, replacing the CSV at this path with its real annual
+# scheduler is ready, replacing the CSV at this path with its real weekly
 # output is the only change needed - nothing in SignalController changes.
 #
 # Playback PACING is independent of the simulation's own clock (START_HOUR
@@ -286,6 +295,8 @@ ANOMALY_RATE_MIN = 0.22          # vehicles discharged per second OF GREEN
 ENABLE_LOGGING = True
 LOG_PATH = "sensor_log.csv"
 LOG_INTERVAL_S = 10.0
+
+CHANNEL_LOG_CAP = 20             # entries kept for the dashboard's channel log
 
 # =============================================================================
 # SECTION 7 - COLOURS
@@ -821,6 +832,22 @@ class Simulation:
         self.log_rows = []
         self._next_log = LOG_INTERVAL_S
 
+        # Security channel: encrypts/authenticates the periodic sensor
+        # reading sent to the dashboard operator (see _maybe_log below). It
+        # is a second, parallel "what does the operator see" path, built on
+        # top of the same discharge counts SensorSystem already computes.
+        # Nothing downstream of a sensor reading is allowed to change
+        # simulation behaviour (DESIGN RULE 1 above), so this channel is
+        # never read by SignalController, Vehicle, or SensorSystem - the
+        # attack surface here is what the human operator is told, not what
+        # the signals do. That is the correct scope, not a limitation.
+        #
+        # auth.py exists and is unit tested (security/test_security.py);
+        # dashboard login UI is not yet wired in - see DECISIONS.md ADR-023
+        # consequences.
+        self.channel = SensorChannel(crypto=SensorCrypto(), encryption_enabled=True)
+        self.channel_log = []              # most-recent-first, capped at CHANNEL_LOG_CAP
+
     # -- clock --------------------------------------------------------------
     @property
     def hour(self):
@@ -1016,6 +1043,7 @@ class Simulation:
             return
         self._next_log += LOG_INTERVAL_S
         for arm in ARMS:
+            discharged = len(self.sensors.discharges[arm])
             self.log_rows.append({
                 "sim_time_s": round(self.sim_time, 1),
                 "clock": self.clock_string(),
@@ -1023,7 +1051,7 @@ class Simulation:
                 "demand_window": len(self.sensors.demand[arm]),
                 "arrivals_window": len(self.sensors.arrivals[arm]),
                 "blocked_entries": self.sensors.total_blocked[arm],
-                "discharged_window": len(self.sensors.discharges[arm]),
+                "discharged_window": discharged,
                 "green_seconds_window": round(self.sensors.green_s[arm], 2),
                 "discharge_per_green_s": round(self.sensors.rate[arm], 4),
                 "queue_length": self.sensors.queue_len[arm],
@@ -1032,6 +1060,34 @@ class Simulation:
                 "accident_location": self.accident.label() if self.accident else "",
                 "anomaly_flag": int(self.sensors.anomaly[arm]),
             })
+
+            # Parallel operator-facing path: send this arm's discharge
+            # count through the (possibly encrypted, possibly attacked)
+            # sensor channel. This is entirely separate from the log_rows
+            # entry above - a rejected or tampered reading only ever
+            # updates channel_log for the dashboard; it is never merged
+            # back into log_rows and never touches self.sensors, so the
+            # anomaly detector and sensor_log.csv are unaffected by it.
+            self._send_channel_reading(arm, discharged)
+
+    def _send_channel_reading(self, arm, vehicles):
+        try:
+            event = self.channel.send_and_receive({"road": arm, "vehicles": vehicles})
+            self.channel_log.insert(0, {
+                "arm": arm,
+                "accepted": True,
+                "reason": event.reason,
+                "reported_road": event.plaintext.get("road"),
+                "reported_vehicles": event.plaintext.get("vehicles"),
+                "true_vehicles": vehicles,
+            })
+        except ChannelRejected as exc:
+            self.channel_log.insert(0, {
+                "arm": arm,
+                "accepted": False,
+                "reason": str(exc),
+            })
+        del self.channel_log[CHANNEL_LOG_CAP:]
 
     def write_log(self, path=LOG_PATH):
         if not self.log_rows:
@@ -1226,6 +1282,51 @@ class Renderer:
                       C_RED if flagged else C_MUTED)
             y += 82
 
+        # Security channel panel: what the operator sees, not what the
+        # signals do. Encryption state and the last few accept/reject
+        # outcomes from sim.channel_log (populated in Simulation._maybe_log,
+        # Section 13) - the visible proof that toggling E changes whether
+        # an active attack (F/G) succeeds, without restarting.
+        sec = pygame.Rect(SIM_X1 + 16, 380, 212, 210)
+        pygame.draw.rect(sc, C_CARD, sec, border_radius=5)
+        self.text("SENSOR CHANNEL", SIM_X1 + 30, 390, self.f_small, C_MUTED)
+
+        enc = sim.channel.encryption_enabled
+        self.text("ENCRYPTION  [E]", SIM_X1 + 30, 410, self.f_small, C_MUTED)
+        self.text("ON" if enc else "OFF", SIM_X1 + 30, 428,
+                  self.f_med, C_GREEN if enc else C_RED)
+
+        self.text("[F] false data  [G] spoof  [H] clear",
+                  SIM_X1 + 30, 454, self.f_small, C_MUTED)
+
+        self.text("RECENT READINGS", SIM_X1 + 30, 478, self.f_small, C_MUTED)
+        row_y = 496
+        for entry in sim.channel_log[:5]:
+            if not entry["accepted"]:
+                self.text(f"{entry['arm']:<6}REJECTED", SIM_X1 + 30, row_y,
+                          self.f_small, C_RED)
+                row_y += 17
+                continue
+
+            # An accepted-but-forged reading is the whole point of the
+            # demonstration: it must be visibly wrong here, not just
+            # "accepted", or toggling E has nothing to show.
+            arm = entry["arm"]
+            reported_road = entry["reported_road"]
+            reported_vehicles = entry["reported_vehicles"]
+            true_vehicles = entry["true_vehicles"]
+            road_spoofed = reported_road != arm
+            count_faked = reported_vehicles != true_vehicles
+            if road_spoofed or count_faked:
+                label_road = f"{arm}->{reported_road}" if road_spoofed else arm
+                label = f"{label_road} {reported_vehicles} (sent {true_vehicles})"
+                colour = C_RED
+            else:
+                label = f"{arm:<6}{reported_vehicles}"
+                colour = C_MUTED
+            self.text(label, SIM_X1 + 30, row_y, self.f_small, colour)
+            row_y += 17
+
         # Anomaly summary.
         box = pygame.Rect(SIM_X1 + 16, 600, 212, 82)
         active = sim.sensors.any_anomaly()
@@ -1323,6 +1424,14 @@ def main():
                     speed = 2.0
                 elif event.key == pygame.K_3:
                     speed = 4.0
+                elif event.key == pygame.K_e:
+                    sim.channel.encryption_enabled = not sim.channel.encryption_enabled
+                elif event.key == pygame.K_f:
+                    sim.channel.add_interceptor(FalseDataInjectionAttack())
+                elif event.key == pygame.K_g:
+                    sim.channel.add_interceptor(SensorSpoofingAttack())
+                elif event.key == pygame.K_h:
+                    sim.channel.clear_interceptors()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if camera_on:

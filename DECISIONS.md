@@ -1528,3 +1528,103 @@ Intersections: Informational Guide, FHWA-HRT-04-091.
 https://epg.modot.org/index.php?title=902.7_Flashing_Operation_of_Traffic_Control_Signals_(MUTCD_Chapter_4G)
 MUTCD 11th Edition, Part 4, Chapter 4C signal warrants.
 https://mutcd.fhwa.dot.gov/pdfs/11th_Edition/part4.pdf
+
+## ADR-023: Security architecture — AES-256-GCM/bcrypt role separation, in-process channel, two-attack scope
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+**Context**
+
+The dissertation requires a demonstrable security architecture, not only a
+described one. Before the sensor channel could be protected, three
+questions needed settling: what protects a sensor reading in transit, how
+is the human operator authenticated for manual override, and what is
+realistically buildable on one laptop before 23 August. A further
+complication emerged on inspection of traffic_sim.py: SensorSystem
+(Section 12) reads vehicle state directly out of `self.vehicles` every
+frame. There was no discrete sensor-reading message anywhere in the
+codebase for a channel abstraction to sit in front of — one had to be
+introduced, not merely wrapped around something existing.
+
+**Decision**
+
+AES-256-GCM (AEAD) protects a periodic per-arm sensor reading in transit
+and sensor_log.csv at rest. bcrypt authenticates the human operator for
+manual override. These solve different problems and are not
+interchangeable: bcrypt is a deliberately slow password hash with no
+freshness guarantee, unsuitable for authenticating a stream of readings
+without making replay trivial; AES-GCM gives confidentiality and a
+tamper-evident tag in one operation, which is what makes "tampering fails
+to decrypt" demonstrable rather than only logged after the fact.
+
+The introduced sensor-reading message is emitted at the existing
+LOG_INTERVAL_S cadence (10 simulated seconds), inside `_maybe_log()`, not
+per frame — this keeps AES-GCM overhead off the 60fps physics loop and
+matches the granularity a real IoT sensor network would report at. The
+reading carries the discharged-vehicle count for the window, since that
+is the value an attacker would most plausibly want to fake, and is kept
+strictly separate from SensorSystem's own internal counters: an attack can
+corrupt what the dashboard displays to a human operator, but the project's
+pre-planned-signal invariant already means nothing downstream of a sensor
+reading is permitted to alter simulation behaviour, so this is the correct
+attack surface, not a limitation.
+
+The channel is modelled in-process (Option B in earlier design notes):
+channel.py passes bytes through interceptor callables rather than opening
+real UDP sockets. Scapy and packet-level attacks are out of scope; the
+ethics form is being corrected to remove any claim of real network
+traffic being generated or intercepted.
+
+Exactly two attacks are implemented — false data injection and sensor
+spoofing — both as channel interceptors. DoS/DDoS was considered and
+dropped: a credible denial-of-service demonstration needs network
+infrastructure and load generation not available for this project.
+Confirmed absent from the codebase via
+`Select-String -Path *.py -Pattern "dos|ddos|flood|denial"`.
+
+Encryption is a runtime toggle (`channel.encryption_enabled`) bound to a
+dashboard key, not a deletable code path, so the same attack demonstrably
+succeeds and fails with one keypress and no restart.
+
+**Alternatives rejected**
+
+Wiring the channel into SensorSystem's per-frame vehicle reads directly.
+Rejected: AES-GCM at 60fps across four arms adds cost with no
+demonstrable benefit, and conflates "what physically happens in the
+simulation" with "what a compromised sensor reports," which are supposed
+to be separable.
+
+Building a pygame login UI for auth.py tonight. Rejected on time budget —
+auth.py exists and is unit tested (security/test_security.py, 12/12
+passing) but is not wired into the dashboard. Recorded as unintegrated
+rather than silently dropped.
+
+**Consequences**
+
+Positive: the encryption-off/on contrast is empirically verifiable, not
+just asserted — security/test_security.py asserts both outcomes for both
+attacks and passes. ISO 27001 controls A.8.24 (crypto), A.5.17/A.8.5
+(authentication) are demonstrated by running code.
+
+Negative: the in-process channel means attacker and defender share a
+process and trust boundary. Sufficient to demonstrate the cryptographic
+properties correctly, not evidence against a network-positioned
+adversary — state this limitation explicitly rather than let the demo
+imply more.
+
+A stale comment at traffic_sim.py lines 228–229 ("real annual output"),
+contradicting ADR-012's weekly regeneration horizon, was corrected as part
+of this pass. This is a one-line comment fix, not a decision with a
+rejected alternative, and is not itself the subject of this entry.
+
+auth.py's dashboard integration, Isolation Forest anomaly detection
+(distinct from the rule-based detector already in SensorSystem, Section
+12), encrypted-storage wiring into the live sensor log, and the
+HOURLY_DEMAND/ANOMALY_RATE_MIN correction remain open, per the existing
+19–20 Aug plan.
+
+**Sources**
+
+None, design decision. Test results (12/12 passing) produced 2026-08-18
+by security/test_security.py.
