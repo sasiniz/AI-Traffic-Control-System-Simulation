@@ -1628,3 +1628,274 @@ HOURLY_DEMAND/ANOMALY_RATE_MIN correction remain open, per the existing
 
 None, design decision. Test results (12/12 passing) produced 2026-08-18
 by security/test_security.py.
+
+## ADR-024: HOURLY_DEMAND correction and ANOMALY_RATE_MIN recalibration
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+**Context**
+
+HOURLY_DEMAND (traffic_sim.py, Section 5) was fabricated, not derived from
+data/traffic_final_cleaned.csv despite that file being the project's stated
+source of demand. Summed across all four arms, the fabricated table's hour-8
+values (North 780, South 700, East 520, West 540 — read directly from the
+pre-correction array) total 2540 veh/h; the corrected, dataset-derived
+values at the same hour (North 33, South 11, East 9, West 5) total 58 veh/h
+— roughly 44x inflated. ANOMALY_RATE_MIN=0.22, and every queue length ever
+observed in the simulation up to that point, had been tuned and interpreted
+against that fiction.
+
+**Decision**
+
+Replace HOURLY_DEMAND with the mean Vehicles per (Road, hour-of-day) across
+the full data/traffic_final_cleaned.csv, rounded to the nearest vehicle.
+Verified independently before use (grouped by road+hour, mean, round): exact
+match to the corrected table, zero discrepancy. Recalibrate ANOMALY_RATE_MIN
+from 0.22 to 0.15, using the empirical CDF of a measured accident-blockage
+rate distribution (60 sim-min headless, peak hour, real accident on North;
+n=31885 qualifying frames; min=0.0, p10=0.0, median=0.0999, p90=0.15,
+max=0.2198) — 0.15 flags 88.7% of blockage frames while staying under the
+observed maximum.
+
+**Alternatives rejected**
+
+Recalibrating ANOMALY_QUEUE_MIN alongside ANOMALY_RATE_MIN, to compensate
+for the corrected (much lower) demand. Rejected: out of scope for the pass
+that produced this correction, and doing so blind — without first confirming
+what queue lengths real demand can actually produce — risked tuning a
+threshold to "look right" rather than to measurement. Left unchanged, with
+its consequence (below) recorded rather than papered over.
+
+Leaving ANOMALY_RATE_MIN at 0.22. Rejected: that value was tuned against the
+fabricated demand's inflated queues; the measured real-demand blockage
+distribution gives no basis for it, and the "normal, queue-present"
+distribution at real demand is degenerate (rate=0.0 for every qualifying
+frame observed), so 0.22 could not be justified as sitting between two real,
+separable regimes.
+
+**Consequences**
+
+Positive: HOURLY_DEMAND is now traceable to the dataset the project claims
+to model, with the verification method recorded so a reader can repeat it.
+
+Negative, structural, not a bug: pinch_capacity_veh_per_h =
+(CRAWL_SPEED*60/MIN_GAP)*3600 = 450, against peak_arm_demand_veh_per_h =
+max(HOURLY_DEMAND) = 59 (North, hour 19). 450 >> 59: a lane blockage cannot
+build a persistent queue at real demand. Measured directly: 90 sim-minutes
+headless (normal operation at two hours of day, plus a real hour-long
+accident at peak demand) never once reached ANOMALY_QUEUE_MIN=5; max queue
+observed including during the accident was 4. The busiest single hour across
+all four approaches in the dataset is 353 vehicles, degree of saturation
+~0.25 — the junction runs far below saturation by construction of the real
+data, not by a simulation defect. This directly motivated the
+DEMAND_MULTIPLIER presentation parameter (ADR-026).
+
+**Sources**
+
+Recalibration evidence and the 450/59 veh/h arithmetic: commit fb379fe
+("Replace fabricated HOURLY_DEMAND with real dataset means; recalibrate
+ANOMALY_RATE_MIN") and commit 3458083 ("Add threat classification (S1-S5)
+and a disclosed demo demand multiplier"), Phase 0 evidence section. Old/new
+hour-8 per-arm values (780/700/520/540 vs 33/11/9/5) read directly from
+commit fb379fe's diff of traffic_sim.py; the 2540/58/~44x sums were computed
+this session directly from those repo-read values, not from memory.
+
+## ADR-025: Threat classification S1-S5 and attack magnitude modes
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+**Context**
+
+crypto.py and channel.py (ADR-023) can answer "was this message tampered
+with in transit" but not "is what the dashboard is showing right now a
+cyberattack or a real traffic incident" — that requires combining the
+channel's verdict with SensorSystem's physical state and the pattern of
+readings across arms and time. Additionally, the only attack magnitude
+available at the time (a fixed, obviously implausible constant) demonstrated
+nothing beyond what a bounds check alone could catch, and encryption alone
+stops mattering once a key is compromised, with no control left in the
+codebase to demonstrate defence in depth against that scenario.
+
+**Decision**
+
+security/detection.py implements five signals as pure functions (no pygame,
+no traffic_sim import): S1 INTEGRITY_FAIL (AEAD rejection, only meaningful
+when encryption was enabled), S2 IMPLAUSIBLE (reported count exceeds
+green_s/1.9s HCM saturation headway — same citation as ADR-006/ADR-021), S3
+DIVERGENCE (reported != true, threshold 0), S4 SIMULTANEITY (3+ arms flagged
+in one interval), S5 PHYSICAL (the existing, unmodified SensorSystem rule).
+Classified in a fixed priority order into NORMAL / PHYSICAL_INCIDENT /
+AMBIGUOUS / CYBER_LIKELY / CYBER_CONFIRMED.
+
+security/attacks.py's FalseDataInjectionAttack gained a mode parameter:
+"crude" (a fixed, physically impossible constant, default 999) versus
+"stealthy" (scales the TRUE value by a small factor, default 1.3, minimum
+absolute change of 1). Crude exists to show that naive attacks are caught by
+plausibility checks (S2) alone, with no cryptography required — the weaker
+demonstration, because a bounds check is a much smaller control to defeat
+than a cipher. Stealthy stays inside the plausible envelope and evades S2,
+so only S3 (or, with encryption on, S1) catches it — the stronger, more
+realistic demonstration of what an attacker who has done their homework
+would actually send.
+
+Both attacks gained an optional crypto= constructor argument modelling a
+stolen key: the attack decrypts the intercepted message, alters the
+payload, and re-encrypts with the same key, producing a message that passes
+AEAD verification. This is the scenario that justifies detection existing at
+all — cryptography cannot help once the key is compromised, so a
+stolen-key stealthy attack (encryption on, S1 does not fire) is caught only
+by S3, the defence-in-depth case: press one key, the attack now passes
+encryption, and detection catches it anyway.
+
+**Alternatives rejected**
+
+Giving S3 access to a genuinely independent measurement. Rejected for this
+project: S3 compares the channel's reported value against `true_vehicles`,
+which in this codebase is simulation ground truth — the same Simulation
+object that sends the reading also knows exactly how many vehicles it sent.
+A real deployment has no such oracle. S3's role would have to be played by a
+redundant sensing modality (e.g. an inductive loop cross-checked against a
+camera count) or by the Random Forest's forecast residual for that
+arm/hour. Building either was out of scope; the simplification is stated
+explicitly in security/detection.py's module docstring rather than left
+implicit, so the signal is not presented as more realistic than it is.
+
+A non-zero DIVERGENCE_THRESHOLD_VEHICLES, to model measurement noise.
+Rejected: reported and true_vehicles are computed from the exact same
+integer count in the same function call and transmitted synchronously, so
+there is no independent noise source between them in this architecture — a
+non-zero tolerance would be inventing slack that has no source in the
+design.
+
+**Consequences**
+
+Positive: the crude/stealthy contrast and the key-compromise variant are
+both empirically verified, not just argued: a stolen-key stealthy attack
+correctly does not trip S1 (accepted=True) and is still caught by
+S3_DIVERGENCE (e.g. South: reported=6 <= physical bound=10.54, evading S2,
+while diverging from true=5).
+
+Negative, measured and disclosed rather than tuned away: S2 produced false
+positives on genuine, unattacked traffic, because its physical bound
+(green_s/1.9) does not hold over short slivers of the 20s rolling discharge
+window. Before the S2_MIN_GREEN_S guard (commit 0e869d0): 0.14-0.28% at
+demand 1x, 9/120 (7.50%) at demand 10x. After the guard (mirroring the
+existing ANOMALY_MIN_GREEN_S=6.0 precedent rather than inventing a new
+number): 0/120 (0.00%) at 1x, 3/120 (2.50%) at 10x. The residual 2.50% is a
+different, genuine phenomenon (real bursts of discharge exceeding the
+idealised continuous-flow HCM bound, e.g. reported=true=7 against a bound of
+5.22 at green_s=9.92), not the sub-guard artefact the fix targeted, and was
+reported rather than suppressed.
+
+**Sources**
+
+Signal design, magnitude modes, key-compromise variant: commit 3458083
+("Add threat classification (S1-S5) and a disclosed demo demand
+multiplier"). S2_MIN_GREEN_S guard and before/after false positive rates:
+commit 0e869d0 ("Add S2_MIN_GREEN_S guard to suppress a real S2
+false-positive source"). S3 ground-truth simplification: security/
+detection.py module docstring, "CRITICAL HONESTY REQUIREMENT" section,
+introduced in commit 3458083.
+
+## ADR-026: Demand multiplier and density levels as disclosed presentation parameters, and time speed as the honest alternative
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+**Context**
+
+ADR-024 established that real demand cannot produce a persistent queue:
+pinch_capacity_veh_per_h (450) vastly exceeds peak_arm_demand_veh_per_h
+(59), so SensorSystem's physical rule (S5) is structurally unreachable at
+real demand, confirmed empirically (a real hour-long accident at peak
+demand never once reached ANOMALY_QUEUE_MIN=5). Demonstrating
+PHYSICAL_INCIDENT classification therefore requires either fabricating
+demand or an impractical amount of wall-clock waiting for a rare event that
+may not arrive at all within a fixed viewing session.
+
+**Decision**
+
+DEMAND_MULTIPLIER (default 1.0) scales `_spawn_probability` only, and is
+documented as a presentation parameter whose value must never be used to
+produce a reported result. DEMAND_LEVELS = (1.0, 10.0, 25.0, 50.0) gives
+discrete selectable levels via dashboard buttons and a cycling key. The
+choice of levels is grounded in a measured per-arm saturation table
+(signal_timeline.csv, at each arm's own peak hour, not assumed;
+capacity_veh_per_h = mean_green_s * cycles_per_hour / 1.9s): North (peak hr
+19) capacity 733.1 veh/h against demand 59 -> 12.43x; South (hr 19) 381.2
+against 18 -> 21.18x; East (hr 20) 329.3 against 20 -> 16.47x; West (hr 12)
+291.0 against 11 -> 26.45x. 10x oversaturates no arm; 25x oversaturates
+North, South and East but not West; 50x oversaturates every arm. Above
+roughly 12x (North's own multiplier, the lowest of the four and so the
+first to break), the junction is oversaturated by construction: S5 fires
+from raw capacity limits rather than any simulated incident, and S2 fires
+more often because genuine bursts routinely exceed the idealised HCM bound.
+10x is therefore recorded as the highest DEMAND_LEVELS entry at which the
+detectors remain meaningful; 25x and 50x exist only to force queue
+formation for demonstration, and a result produced at those levels is
+evidence of deliberate oversaturation, not of detector quality.
+
+SPEED_LEVELS = (1, 5, 20, 50) scales the simulation clock only, via
+sub-stepping in main() rather than a single scaled-dt update — the naive
+approach was verified to let vehicles pass through each other at high
+speed: at speed=50 with a single dt*speed step, MAX_SPEED*50=110px exceeds
+MIN_GAP=48px; empirically, 20559 overlap-violation frame-instances were
+observed in a 3600-frame run. Sub-stepping fixes physics at every level
+(max single-substep step measured at 2.2px, identical to the 1x baseline,
+at every SPEED_LEVELS value; zero overlap and zero overshoot violations at
+S=50 after the fix). TIME fabricates nothing — HOURLY_DEMAND, CRAWL_SPEED,
+MIN_GAP and every other physical constant are untouched by it — so it is
+recorded as the preferred demonstration mechanism over DEMAND_LEVELS: the
+honest way to see more traffic in a shorter viewing session. DEMAND_LEVELS
+should only be reached for when TIME alone is not enough (forcing a queue
+for an S5 demo).
+
+**Alternatives rejected**
+
+Changing CRAWL_SPEED, MIN_GAP, ANOMALY_QUEUE_MIN or HOURLY_DEMAND to make a
+queue-forming demo possible without a multiplier. Rejected explicitly and
+repeatedly across this work: these are the physical constants and the
+verified dataset; tuning them to "make a demo work" would silently
+reintroduce the same fabrication ADR-024 removed, this time in the
+constants a false positive or a physical incident is measured against,
+rather than in the demand feeding them.
+
+A single DEMO x10 toggle (the first implementation). Rejected in favour of
+selectable DEMAND_LEVELS once the saturation table above showed 10x alone
+does not reach oversaturation on any arm, so a viewer wanting to force
+queue formation for a demonstration had no way to do so without editing
+code.
+
+Reducing MAX_SUBSTEPS_PER_FRAME's cap, or growing sub-step size, when a
+frame needs more sub-steps than the cap allows. Rejected: either would
+corrupt physics (larger steps) or drop simulated time (fewer steps than
+needed). Excess simulated time carries into the next rendered frame
+instead, so only the achieved render framerate is affected, never physics.
+
+**Consequences**
+
+Positive: no reported result in this session used a density multiplier
+other than 1.0 — the evidence behind ADR-024 and ADR-025 was gathered at
+DEMAND_MULTIPLIER=1.0 throughout, with DEMAND_LEVELS used only for the
+demonstration-specific reviews that are themselves about the multiplier's
+own effect (e.g. confirming PHYSICAL_INCIDENT classification becomes
+reachable at 10x).
+
+Negative, measured and disclosed: at demand=1x, speed=50, achieved
+framerate measured at 52.9fps (headless proxy, SDL dummy driver, draw calls
+executed but not displayed) — below the 60fps target. Physics correctness
+is unaffected (zero violations at S=50, see Decision above); only the
+render rate dips, exactly as designed, and this was reported rather than
+hidden or fixed by silently reducing sub-steps.
+
+**Sources**
+
+R1 saturation table and R2 blocked-at-entry figures: commit c974506
+("Replace DEMO x10 toggle with selectable density levels (1x/10x/25x/50x)").
+Sub-stepping bug verification, fix, and Review 2 figures (2a-2i, including
+the 52.9fps measurement): commit 9947df6 ("Separate TIME (honest
+fast-forward) from DENSITY (fabricated demand)"). Pinch capacity / peak
+demand arithmetic: commit fb379fe and commit 3458083 (also cited in
+ADR-024).
