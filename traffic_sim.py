@@ -36,15 +36,18 @@ CONTROLS
     X            clear the current accident
     C            toggle the observer camera overlay
     SPACE        pause / resume
-    1 2 3        simulation speed 1x / 2x / 4x
+    T            cycle TIME (fast-forward) speed 1x -> 5x -> 20x -> 50x -> 1x
+                 (dashboard buttons set a level directly; real demand,
+                 nothing fabricated - see Section 5)
     E            toggle sensor channel encryption on/off
     F            inject false data attack on the sensor channel
     G            inject sensor spoofing attack on the sensor channel
     H            clear active sensor channel attacks
     S            toggle stealthy magnitude mode for the next F attack
     K            toggle key-compromise mode for the next F/G attack
-    D            cycle demo density level 1x -> 10x -> 25x -> 50x -> 1x
-                 (dashboard buttons set a level directly; NOT real demand)
+    D            cycle DENSITY (demo) level 1x -> 10x -> 25x -> 50x -> 1x
+                 (dashboard buttons set a level directly; NOT real demand -
+                 see Section 5)
     ESC          quit
 """
 
@@ -91,23 +94,29 @@ LANE_OFFSET = 35                 # lane centre distance from the road centreline
 SEC_PANEL_X = SIM_X1 + 16        # 1036
 SEC_PANEL_Y = 380
 SEC_PANEL_W = 212
-SEC_PANEL_H = 210                # bottom = 590; ANOMALY STATUS starts at 600
+# Grown 210->218 (bottom 590->598) to fit the new TIME/DENSITY row labels
+# below - measured empirically via rendering, not assumed - while staying
+# 2px clear of the THREAT STATUS box, which is unrelated to this constant
+# and still starts at its own fixed y=600 in draw_dashboard.
+SEC_PANEL_H = 218
 
-# A 2-column grid of compact buttons, not full-width 38px buttons: eleven
-# full-width buttons plus a title and a reading list do not fit in ~210px
-# of panel height. Three rows of two columns plus one row of four narrow
-# density buttons fits in ~120px (SEC_BTN_H shrunk from 30 to 24, row gap
-# from 6 to 4, to leave room for RECENT READINGS to show >=3 rows - see
-# draw_dashboard). SEC_PANEL_H (this panel's own height) is unchanged and
-# the THREAT STATUS box below still starts at a fixed y=600.
+# A 2-column grid of compact buttons, not full-width 38px buttons: fifteen
+# full-width buttons, a title, TWO row-identifying labels ("TIME" /
+# "DENSITY" - see draw_dashboard) and a reading list do not fit in ~210px
+# of panel height even after shrinking SEC_BTN_H 30->24->20->18 and row
+# gaps 6->4->3->2. RECENT READINGS is reduced accordingly (see
+# draw_dashboard) - this phase does not require preserving its earlier
+# >=3 row count, only that it does not overlap the THREAT STATUS box.
 SEC_BTN_W = 92
-SEC_BTN_H = 24
+SEC_BTN_H = 18
 _sec_btn_col0 = SEC_PANEL_X + 10
 _sec_btn_col1 = _sec_btn_col0 + SEC_BTN_W + 8
 _sec_btn_row0 = SEC_PANEL_Y + 26
-_sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 4
-_sec_btn_row2 = _sec_btn_row1 + SEC_BTN_H + 4
-_sec_btn_row3 = _sec_btn_row2 + SEC_BTN_H + 4
+_sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 2
+_sec_btn_row2 = _sec_btn_row1 + SEC_BTN_H + 2
+_LEVEL_LABEL_H = 14   # vertical room reserved for the "TIME"/"DENSITY" caption above each level row
+_sec_btn_row3 = _sec_btn_row2 + SEC_BTN_H + 4 + _LEVEL_LABEL_H   # TIME level row (+ its caption)
+_sec_btn_row4 = _sec_btn_row3 + SEC_BTN_H + 4 + _LEVEL_LABEL_H   # DENSITY level row (+ its caption)
 
 SEC_BUTTONS = {
     "encryption":    pygame.Rect(_sec_btn_col0, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
@@ -121,23 +130,29 @@ SEC_BUTTONS = {
     "toggle_key_compromise": pygame.Rect(_sec_btn_col1, _sec_btn_row2, SEC_BTN_W, SEC_BTN_H),
 }
 
-# Density level buttons: one row of four, replacing the old single DEMO x10
-# toggle. Labels are the single source of truth for both the button keys
-# below and main()'s sec_actions mapping to DEMAND_LEVELS (Section 5) -
-# they must stay in the same order as that tuple (1x -> 1.0, etc.).
-# Width is computed from the panel's usable row width (SEC_PANEL_W minus
-# the same 10px margins used by the 2-column grid above), not guessed:
-# measured via pygame font.size() at f_small, the widest label ("25x"/
-# "50x") renders at 17px, so DENSITY_BTN_W (43px) leaves ~26px of padding
-# either side of the text - comfortably sufficient.
-DENSITY_BUTTON_LABELS = ("1x", "10x", "25x", "50x")
-DENSITY_BTN_GAP = 6
-DENSITY_BTN_W = (SEC_PANEL_W - 20 - 3 * DENSITY_BTN_GAP) // len(DENSITY_BUTTON_LABELS)  # 43
+# TIME and DENSITY level buttons: one row of four each. Labels are the
+# single source of truth for both the button keys below and main()'s
+# sec_actions mapping to SPEED_LEVELS / DEMAND_LEVELS (Section 5) - each
+# must stay in the same index order as its tuple (1x -> levels[0], etc.).
+# Shared width/gap for both rows, computed from the panel's usable row
+# width (SEC_PANEL_W minus the same 10px margins used by the 2-column
+# grid above), not guessed: measured via pygame font.size() at f_small,
+# the widest label across both rows ("20x"/"25x"/"50x") renders at 17px,
+# so LEVEL_BTN_W (43px) leaves ~26px of padding either side of the text -
+# comfortably sufficient.
+TIME_BUTTON_LABELS = ("1x", "5x", "20x", "50x")        # order matches SPEED_LEVELS
+DENSITY_BUTTON_LABELS = ("1x", "10x", "25x", "50x")    # order matches DEMAND_LEVELS
+LEVEL_BTN_GAP = 6
+LEVEL_BTN_W = (SEC_PANEL_W - 20 - 3 * LEVEL_BTN_GAP) // 4  # 43
 
+for _i, _label in enumerate(TIME_BUTTON_LABELS):
+    SEC_BUTTONS[f"time_{_label}"] = pygame.Rect(
+        _sec_btn_col0 + _i * (LEVEL_BTN_W + LEVEL_BTN_GAP),
+        _sec_btn_row3, LEVEL_BTN_W, SEC_BTN_H)
 for _i, _label in enumerate(DENSITY_BUTTON_LABELS):
     SEC_BUTTONS[f"density_{_label}"] = pygame.Rect(
-        _sec_btn_col0 + _i * (DENSITY_BTN_W + DENSITY_BTN_GAP),
-        _sec_btn_row3, DENSITY_BTN_W, SEC_BTN_H)
+        _sec_btn_col0 + _i * (LEVEL_BTN_W + LEVEL_BTN_GAP),
+        _sec_btn_row4, LEVEL_BTN_W, SEC_BTN_H)
 del _i, _label
 
 # =============================================================================
@@ -374,8 +389,43 @@ START_HOUR = 8                   # simulation clock starts at 08:00
 # West (25 < 26.45); 50x is oversaturated on EVERY arm (50 > 26.45, the
 # largest). This is why higher levels are expected to show blocked-at-
 # entry counts climbing - see this session's R2 review evidence.
+#
+# WARNING - above roughly 12x (North's own measured saturation multiplier,
+# the LOWEST of the four arms above, so the first to break) the junction
+# is oversaturated by construction, not by any simulated incident: S5
+# fires from raw capacity limits rather than a blockage, and S2 fires more
+# often because bursts of genuinely-arriving vehicles routinely exceed the
+# idealised continuous-flow HCM bound at these demand levels. 10x is
+# therefore the highest DEMAND_LEVELS entry at which the detectors remain
+# meaningful - i.e. still distinguishing an incident from ordinary
+# (if dense) traffic. 25x and 50x exist ONLY to force queue formation for
+# demonstration purposes; a PHYSICAL_INCIDENT or a false positive produced
+# at those levels is not evidence about detector quality, it is evidence
+# that the junction has been deliberately oversaturated.
 DEMAND_MULTIPLIER = 1.0
 DEMAND_LEVELS = (1.0, 10.0, 25.0, 50.0)  # order must match DENSITY_BUTTON_LABELS (Section 1)
+
+# Honest fast-forward: scales the SIMULATION CLOCK only (how much sim-time
+# elapses per rendered frame, via sub-stepping - see main()). Unlike
+# DEMAND_MULTIPLIER, this fabricates nothing - HOURLY_DEMAND, CRAWL_SPEED,
+# MIN_GAP and every other physical constant are untouched, so a result
+# recorded at any SPEED_LEVELS value is exactly as real as one recorded at
+# 1x, just observed faster. This is the preferred way to see more traffic
+# in a shorter viewing session; DEMAND_LEVELS should only be reached for
+# when TIME alone is not enough (e.g. forcing a queue for an S5 demo).
+SPEED_LEVELS = (1, 5, 20, 50)  # order must match TIME_BUTTON_LABELS (Section 1)
+
+# Sub-stepping cap (main()): at SPEED_LEVELS' maximum (50) with dt~=1/60,
+# one rendered frame needs ~50 physics sub-steps of dt=1/60 each to cover
+# 50/60s of simulated time without ever using a larger sub-step (see the
+# bug this replaces, verified this session: at speed=50 with a single
+# dt*speed step, MAX_SPEED*50=110px > MIN_GAP=48px, so a vehicle can pass
+# through another or a stop line within one update). 120 gives a ~2.4x
+# margin above that for clock jitter without ever growing sub-step size -
+# if a frame still needs more, the excess simulated time carries over to
+# the NEXT rendered frame instead, which is what reduces the achieved
+# framerate rather than corrupting physics.
+MAX_SUBSTEPS_PER_FRAME = 120
 
 # =============================================================================
 # SECTION 6 - SENSOR AND ANOMALY CONSTANTS
@@ -1547,7 +1597,7 @@ class Renderer:
         example = classification_by_arm[arms[0]]
         return worst, arms, signals, example.confidence, example.action
 
-    def draw_dashboard(self, sim):
+    def draw_dashboard(self, sim, speed):
         sc = self.screen
         pygame.draw.rect(sc, C_PANEL, (SIM_X1, 0, DASH_W, HEIGHT))
         self.text("SENSOR DASHBOARD", SIM_X1 + 16, 16, self.f_title, C_MUTED)
@@ -1592,25 +1642,50 @@ class Renderer:
                           C_AMBER if sim.attack_stealthy else C_CARD)
         self._sec_button(SEC_BUTTONS["toggle_key_compromise"], "KEY COMP [K]",
                           C_RED if sim.attack_key_compromise else C_CARD)
+        # TIME level buttons (Section 1): one row of four, highlighting the
+        # active speed. C_BLUE, not C_AMBER - TIME scales the simulation
+        # clock only (via sub-stepping in main()) and fabricates nothing;
+        # HOURLY_DEMAND, CRAWL_SPEED, MIN_GAP etc. are untouched. Distinct
+        # colour from DENSITY below so a viewer can tell at a glance which
+        # control fabricates traffic and which does not, per this label's
+        # own text.
+        time_label_y = SEC_BUTTONS["time_1x"].top - 14
+        self.text("TIME (real demand, fast-forward)", SEC_PANEL_X + 14,
+                  time_label_y, self.f_small, C_MUTED)
+        for _label, _level in zip(TIME_BUTTON_LABELS, SPEED_LEVELS):
+            active = speed == _level
+            self._sec_button(SEC_BUTTONS[f"time_{_label}"], _label,
+                              C_BLUE if active else C_CARD)
+
         # Density level buttons (Section 1): one row of four, highlighting
         # whichever level is active. C_AMBER matches the banner colour in
         # draw_junction so "not real demand" reads consistently everywhere
-        # a level other than 1x is showing; at most one is ever active.
+        # a level other than 1x is showing - but active 1x itself must NOT
+        # render amber, or the "honest" state would be shown in the same
+        # colour as the fabrication warning it exists to avoid; it gets
+        # C_GREEN instead, matching the ENCRYPT button's "safe state" use
+        # of the same colour elsewhere on this panel.
+        density_label_y = SEC_BUTTONS["density_1x"].top - 14
+        self.text("DENSITY (simulated, NOT real)", SEC_PANEL_X + 14,
+                  density_label_y, self.f_small, C_MUTED)
         for _label, _level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS):
             active = sim.demand_multiplier == _level
-            self._sec_button(SEC_BUTTONS[f"density_{_label}"], _label,
-                              C_AMBER if active else C_CARD)
+            if active:
+                colour = C_GREEN if _level == 1.0 else C_AMBER
+            else:
+                colour = C_CARD
+            self._sec_button(SEC_BUTTONS[f"density_{_label}"], _label, colour)
 
-        readings_y = SEC_BUTTONS[f"density_{DENSITY_BUTTON_LABELS[-1]}"].bottom + 6
+        readings_y = SEC_BUTTONS[f"density_{DENSITY_BUTTON_LABELS[-1]}"].bottom + 4
         self.text("RECENT READINGS", SEC_PANEL_X + 14, readings_y,
                   self.f_small, C_MUTED)
-        row_y = readings_y + 14
+        row_y = readings_y + 11
         # Dynamic, not a hardcoded slice: adapts if panel dimensions ever
-        # change, and is measured (not assumed) to clear >= 3 rows without
-        # reaching the THREAT STATUS box, which starts at a fixed y=600.
+        # change, and is measured (not assumed) to clear the THREAT STATUS
+        # box, which starts at a fixed y=600 - unrelated to SEC_PANEL_H.
         panel_bottom = SEC_PANEL_Y + SEC_PANEL_H
-        row_step = 15
-        max_rows = max(1, (panel_bottom - 4 - row_y) // row_step)
+        row_step = 14
+        max_rows = max(1, (panel_bottom - 3 - row_y) // row_step)
         for entry in sim.channel_log[:max_rows]:
             if not entry["accepted"]:
                 self.text(f"{entry['arm']:<6}REJECTED", SEC_PANEL_X + 14, row_y,
@@ -1757,6 +1832,24 @@ def main():
             i = -1  # unknown value on sim.demand_multiplier -> restart at levels[0]
         sim.demand_multiplier = levels[(i + 1) % len(levels)]
 
+    def _cycle_time_level():
+        # 1 -> 5 -> 20 -> 50 -> 1, wrapping, same pattern as demand.
+        # `speed` is a main()-local (not sim state - it paces sub-stepping,
+        # not simulated demand), so this needs nonlocal, not a lambda.
+        nonlocal speed
+        levels = SPEED_LEVELS
+        try:
+            i = levels.index(speed)
+        except ValueError:
+            i = -1
+        speed = levels[(i + 1) % len(levels)]
+
+    def _make_time_setter(level):
+        def _setter():
+            nonlocal speed
+            speed = level
+        return _setter
+
     sec_actions = {
         "encryption": lambda: setattr(sim.channel, "encryption_enabled",
                                        not sim.channel.encryption_enabled),
@@ -1767,20 +1860,26 @@ def main():
         "toggle_key_compromise": lambda: setattr(sim, "attack_key_compromise",
                                                    not sim.attack_key_compromise),
         "cycle_demand_level": _cycle_demand_level,
+        "cycle_time_level": _cycle_time_level,
     }
-    # One sec_actions entry per density button, each setting its own exact
-    # level directly - DENSITY_BUTTON_LABELS and DEMAND_LEVELS share index
-    # order (see both constants' comments), so zip is the single source of
-    # truth for the label -> value mapping, not a second hardcoded list.
+    # One sec_actions entry per density/time button, each setting its own
+    # exact level directly - the *_BUTTON_LABELS and *_LEVELS tuples share
+    # index order (see each constant's comment), so zip is the single
+    # source of truth for the label -> value mapping, not a hardcoded list.
     sec_actions.update({
         f"density_{label}": (lambda level=level: setattr(sim, "demand_multiplier", level))
         for label, level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS)
+    })
+    sec_actions.update({
+        f"time_{label}": _make_time_setter(level)
+        for label, level in zip(TIME_BUTTON_LABELS, SPEED_LEVELS)
     })
 
     accident_mode = False
     camera_on = False
     paused = False
-    speed = 1.0
+    speed = SPEED_LEVELS[0]
+    pending_sim_time = 0.0   # sub-stepping backlog, see MAX_SUBSTEPS_PER_FRAME
     running = True
 
     while running:
@@ -1801,12 +1900,8 @@ def main():
                     camera_on = not camera_on
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
-                elif event.key == pygame.K_1:
-                    speed = 1.0
-                elif event.key == pygame.K_2:
-                    speed = 2.0
-                elif event.key == pygame.K_3:
-                    speed = 4.0
+                elif event.key == pygame.K_t:
+                    sec_actions["cycle_time_level"]()
                 elif event.key == pygame.K_e:
                     sec_actions["encryption"]()
                 elif event.key == pygame.K_f:
@@ -1842,12 +1937,28 @@ def main():
                             break
 
         if not paused:
-            sim.update(dt * speed)
+            # Sub-stepping, not sim.update(dt * speed): a single call with
+            # a scaled dt corrupts physics at high speed (verified this
+            # session - at speed=50, MAX_SPEED*50=110px > MIN_GAP=48px, so
+            # a vehicle can pass through another or overshoot a stop line
+            # within one update). Each sub-step below is capped at 1/60s,
+            # matching physics resolution at 1x exactly, however large
+            # `speed` is; only the NUMBER of sub-steps changes.
+            pending_sim_time += dt * speed
+            substeps = 0
+            while pending_sim_time > 0 and substeps < MAX_SUBSTEPS_PER_FRAME:
+                step_dt = min(1.0 / 60.0, pending_sim_time)
+                sim.update(step_dt)
+                pending_sim_time -= step_dt
+                substeps += 1
+            # If MAX_SUBSTEPS_PER_FRAME was hit, leftover pending_sim_time
+            # carries into next frame's loop instead of growing step_dt -
+            # the achieved framerate drops, physics never does.
 
         screen.fill(C_BG)
         renderer.draw_junction(sim, accident_mode)
         renderer.draw_control_panel(sim, accident_mode, camera_on, paused, speed)
-        renderer.draw_dashboard(sim)
+        renderer.draw_dashboard(sim, speed)
         if camera_on:
             renderer.draw_cameras(sim)
         pygame.display.flip()
