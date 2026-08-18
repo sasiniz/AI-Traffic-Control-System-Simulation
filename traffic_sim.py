@@ -43,7 +43,8 @@ CONTROLS
     H            clear active sensor channel attacks
     S            toggle stealthy magnitude mode for the next F attack
     K            toggle key-compromise mode for the next F/G attack
-    D            toggle demo demand multiplier (x10, NOT real demand)
+    D            cycle demo density level 1x -> 10x -> 25x -> 50x -> 1x
+                 (dashboard buttons set a level directly; NOT real demand)
     ESC          quit
 """
 
@@ -92,23 +93,21 @@ SEC_PANEL_Y = 380
 SEC_PANEL_W = 212
 SEC_PANEL_H = 210                # bottom = 590; ANOMALY STATUS starts at 600
 
-# A 2-column grid of compact buttons, not full-width 38px buttons: seven
+# A 2-column grid of compact buttons, not full-width 38px buttons: eleven
 # full-width buttons plus a title and a reading list do not fit in ~210px
-# of panel height. Three rows of two columns plus one full-width row (the
-# DEMO button) fits in ~138px, leaving the rest for the title and reading
-# list - now down to whatever fits dynamically (see draw_dashboard), since
-# a fourth button row leaves very little room. SEC_PANEL_H (this panel's
-# own height) is unchanged and the THREAT STATUS box below still starts at
-# a fixed y=600 - the new row is absorbed by shrinking the reading list,
-# not by growing this panel downward into that box.
+# of panel height. Three rows of two columns plus one row of four narrow
+# density buttons fits in ~120px (SEC_BTN_H shrunk from 30 to 24, row gap
+# from 6 to 4, to leave room for RECENT READINGS to show >=3 rows - see
+# draw_dashboard). SEC_PANEL_H (this panel's own height) is unchanged and
+# the THREAT STATUS box below still starts at a fixed y=600.
 SEC_BTN_W = 92
-SEC_BTN_H = 30
+SEC_BTN_H = 24
 _sec_btn_col0 = SEC_PANEL_X + 10
 _sec_btn_col1 = _sec_btn_col0 + SEC_BTN_W + 8
-_sec_btn_row0 = SEC_PANEL_Y + 30
-_sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 6
-_sec_btn_row2 = _sec_btn_row1 + SEC_BTN_H + 6
-_sec_btn_row3 = _sec_btn_row2 + SEC_BTN_H + 6
+_sec_btn_row0 = SEC_PANEL_Y + 26
+_sec_btn_row1 = _sec_btn_row0 + SEC_BTN_H + 4
+_sec_btn_row2 = _sec_btn_row1 + SEC_BTN_H + 4
+_sec_btn_row3 = _sec_btn_row2 + SEC_BTN_H + 4
 
 SEC_BUTTONS = {
     "encryption":    pygame.Rect(_sec_btn_col0, _sec_btn_row0, SEC_BTN_W, SEC_BTN_H),
@@ -120,11 +119,26 @@ SEC_BUTTONS = {
     # themselves.
     "toggle_stealth":       pygame.Rect(_sec_btn_col0, _sec_btn_row2, SEC_BTN_W, SEC_BTN_H),
     "toggle_key_compromise": pygame.Rect(_sec_btn_col1, _sec_btn_row2, SEC_BTN_W, SEC_BTN_H),
-    # Demo-only demand scaling (see DEMAND_MULTIPLIER above) - full width,
-    # its own row, extending the same computed-offset pattern as the rows
-    # above rather than a new hardcoded rect.
-    "demo": pygame.Rect(_sec_btn_col0, _sec_btn_row3, SEC_BTN_W * 2 + 8, SEC_BTN_H),
 }
+
+# Density level buttons: one row of four, replacing the old single DEMO x10
+# toggle. Labels are the single source of truth for both the button keys
+# below and main()'s sec_actions mapping to DEMAND_LEVELS (Section 5) -
+# they must stay in the same order as that tuple (1x -> 1.0, etc.).
+# Width is computed from the panel's usable row width (SEC_PANEL_W minus
+# the same 10px margins used by the 2-column grid above), not guessed:
+# measured via pygame font.size() at f_small, the widest label ("25x"/
+# "50x") renders at 17px, so DENSITY_BTN_W (43px) leaves ~26px of padding
+# either side of the text - comfortably sufficient.
+DENSITY_BUTTON_LABELS = ("1x", "10x", "25x", "50x")
+DENSITY_BTN_GAP = 6
+DENSITY_BTN_W = (SEC_PANEL_W - 20 - 3 * DENSITY_BTN_GAP) // len(DENSITY_BUTTON_LABELS)  # 43
+
+for _i, _label in enumerate(DENSITY_BUTTON_LABELS):
+    SEC_BUTTONS[f"density_{_label}"] = pygame.Rect(
+        _sec_btn_col0 + _i * (DENSITY_BTN_W + DENSITY_BTN_GAP),
+        _sec_btn_row3, DENSITY_BTN_W, SEC_BTN_H)
+del _i, _label
 
 # =============================================================================
 # SECTION 2 - TRAFFIC SIDE AND LANE POSITIONS
@@ -344,8 +358,24 @@ START_HOUR = 8                   # simulation clock starts at 08:00
 # cannot build a persistent queue at multiplier 1.0 (see DECISIONS.md /
 # this session's Phase 0 report for the arithmetic). Toggled live via the
 # D key; never edit this constant to "make a demo work".
+#
+# Per-arm saturation multiplier - the level at which demand first exceeds
+# that arm's own capacity - measured from signal_timeline.csv at each
+# arm's own peak hour, not assumed: capacity_veh_per_h = (mean_green_s *
+# cycles_per_hour) / SATURATION_HEADWAY_S (1.9s, HCM, same citation as
+# ADR-006/ADR-021), cycles_per_hour = 3600/120 = 30.
+#   North (peak hr 19): mean_green=46.43s  capacity=733.1  demand=59   -> 12.43x
+#   South (peak hr 19): mean_green=24.14s  capacity=381.2  demand=18   -> 21.18x
+#   East  (peak hr 20): mean_green=20.86s  capacity=329.3  demand=20   -> 16.47x
+#   West  (peak hr 12): mean_green=18.43s  capacity=291.0  demand=11   -> 26.45x
+# So of DEMAND_LEVELS below: 1x is never oversaturated by definition; 10x
+# is oversaturated on NO arm (10 < every multiplier above); 25x IS
+# oversaturated on North, South and East (25 > 12.43/21.18/16.47) but not
+# West (25 < 26.45); 50x is oversaturated on EVERY arm (50 > 26.45, the
+# largest). This is why higher levels are expected to show blocked-at-
+# entry counts climbing - see this session's R2 review evidence.
 DEMAND_MULTIPLIER = 1.0
-DEMO_MULTIPLIER_PRESET = 10.0     # value the D key toggles to
+DEMAND_LEVELS = (1.0, 10.0, 25.0, 50.0)  # order must match DENSITY_BUTTON_LABELS (Section 1)
 
 # =============================================================================
 # SECTION 6 - SENSOR AND ANOMALY CONSTANTS
@@ -1562,26 +1592,30 @@ class Renderer:
                           C_AMBER if sim.attack_stealthy else C_CARD)
         self._sec_button(SEC_BUTTONS["toggle_key_compromise"], "KEY COMP [K]",
                           C_RED if sim.attack_key_compromise else C_CARD)
-        # Demo-only demand scaling (DEMAND_MULTIPLIER, Section 5) - amber
-        # while active, matching the banner colour in draw_junction so the
-        # same "not real demand" state reads consistently everywhere.
-        demo_active = sim.demand_multiplier != 1.0
-        self._sec_button(SEC_BUTTONS["demo"], "DEMO x10 [D]",
-                          C_AMBER if demo_active else C_CARD)
+        # Density level buttons (Section 1): one row of four, highlighting
+        # whichever level is active. C_AMBER matches the banner colour in
+        # draw_junction so "not real demand" reads consistently everywhere
+        # a level other than 1x is showing; at most one is ever active.
+        for _label, _level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS):
+            active = sim.demand_multiplier == _level
+            self._sec_button(SEC_BUTTONS[f"density_{_label}"], _label,
+                              C_AMBER if active else C_CARD)
 
-        readings_y = SEC_BUTTONS["demo"].bottom + 8
+        readings_y = SEC_BUTTONS[f"density_{DENSITY_BUTTON_LABELS[-1]}"].bottom + 6
         self.text("RECENT READINGS", SEC_PANEL_X + 14, readings_y,
                   self.f_small, C_MUTED)
-        row_y = readings_y + 16
-        # Dynamic, not a hardcoded slice: the DEMO row leaves less room
-        # than before, and this adapts if panel dimensions ever change.
+        row_y = readings_y + 14
+        # Dynamic, not a hardcoded slice: adapts if panel dimensions ever
+        # change, and is measured (not assumed) to clear >= 3 rows without
+        # reaching the THREAT STATUS box, which starts at a fixed y=600.
         panel_bottom = SEC_PANEL_Y + SEC_PANEL_H
-        max_rows = max(1, (panel_bottom - 6 - row_y) // 17)
+        row_step = 15
+        max_rows = max(1, (panel_bottom - 4 - row_y) // row_step)
         for entry in sim.channel_log[:max_rows]:
             if not entry["accepted"]:
                 self.text(f"{entry['arm']:<6}REJECTED", SEC_PANEL_X + 14, row_y,
                           self.f_small, C_RED)
-                row_y += 17
+                row_y += row_step
                 continue
 
             # An accepted-but-forged reading is the whole point of the
@@ -1601,7 +1635,7 @@ class Renderer:
                 label = f"{arm:<6}{reported_vehicles}"
                 colour = C_MUTED
             self.text(label, SEC_PANEL_X + 14, row_y, self.f_small, colour)
-            row_y += 17
+            row_y += row_step
 
         # Threat status: security/detection.py's classification, not the
         # raw SensorSystem rule any more. Picks the single most severe
@@ -1712,6 +1746,17 @@ def main():
             crypto=sim.channel.crypto if sim.attack_key_compromise else None,
         )
 
+    def _cycle_demand_level():
+        # 1 -> 10 -> 25 -> 50 -> 1, wrapping. Finds the current level's
+        # index rather than assuming it (the level may have been set
+        # directly by a density_* button press, not by cycling).
+        levels = DEMAND_LEVELS
+        try:
+            i = levels.index(sim.demand_multiplier)
+        except ValueError:
+            i = -1  # unknown value on sim.demand_multiplier -> restart at levels[0]
+        sim.demand_multiplier = levels[(i + 1) % len(levels)]
+
     sec_actions = {
         "encryption": lambda: setattr(sim.channel, "encryption_enabled",
                                        not sim.channel.encryption_enabled),
@@ -1721,9 +1766,16 @@ def main():
         "toggle_stealth": lambda: setattr(sim, "attack_stealthy", not sim.attack_stealthy),
         "toggle_key_compromise": lambda: setattr(sim, "attack_key_compromise",
                                                    not sim.attack_key_compromise),
-        "demo": lambda: setattr(sim, "demand_multiplier",
-                                 DEMO_MULTIPLIER_PRESET if sim.demand_multiplier == 1.0 else 1.0),
+        "cycle_demand_level": _cycle_demand_level,
     }
+    # One sec_actions entry per density button, each setting its own exact
+    # level directly - DENSITY_BUTTON_LABELS and DEMAND_LEVELS share index
+    # order (see both constants' comments), so zip is the single source of
+    # truth for the label -> value mapping, not a second hardcoded list.
+    sec_actions.update({
+        f"density_{label}": (lambda level=level: setattr(sim, "demand_multiplier", level))
+        for label, level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS)
+    })
 
     accident_mode = False
     camera_on = False
@@ -1768,7 +1820,7 @@ def main():
                 elif event.key == pygame.K_k:
                     sec_actions["toggle_key_compromise"]()
                 elif event.key == pygame.K_d:
-                    sec_actions["demo"]()
+                    sec_actions["cycle_demand_level"]()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if camera_on:
