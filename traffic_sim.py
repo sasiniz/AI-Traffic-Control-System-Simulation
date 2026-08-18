@@ -52,16 +52,19 @@ CONTROLS
 """
 
 import csv
+import json
 import math
 import os
 import random
+from datetime import datetime, timezone
 
 import pygame
 
 from security.crypto import SensorCrypto
 from security.channel import SensorChannel, ChannelRejected
 from security.attacks import FalseDataInjectionAttack, SensorSpoofingAttack
-from security.auth import OperatorAuth  # noqa: F401 - not wired in yet, see Section 13
+from security.auth import DEFAULT_CREDENTIALS_PATH, OperatorAuth
+from security.approval import ApprovalRecord, append_approval, sha256_file
 from security import detection as threat_detection
 
 # =============================================================================
@@ -345,6 +348,24 @@ def _bezier_length(p0, c, p2, samples=16):
 SIGNAL_TIMELINE_PATH = os.path.join(os.path.dirname(__file__),
                                     "signal_timeline.csv")
 
+# The file the operator approval gate (main(), Section 15) hashes and
+# asks a human to accept - the PLAN (predicted counts + green seconds per
+# hour/road), not SIGNAL_TIMELINE_PATH above. generate_timeline.py's
+# compile_timeline() expands the plan into the phase-by-phase timeline
+# deterministically; approving the expansion would be approving a
+# derived artefact, not the authored one - see DECISIONS.md's approval
+# ADR. THIS IS THE ONE LINE TO CHANGE when the annual plan
+# (data/signal_schedule_plan_annual.csv, Phase B - not yet built) lands;
+# nothing else about the approval gate needs to change.
+APPROVAL_TARGET_PATH = os.path.join(os.path.dirname(__file__),
+                                    "signal_schedule_plan.csv")
+
+# Read for display only (provenance text in the approval modal) - never
+# hashed, never part of what is approved. Missing or unreadable is
+# handled explicitly (_read_model_provenance), not treated as fatal.
+MODEL_CARD_PATH = os.path.join(os.path.dirname(__file__),
+                               "models", "model_card.json")
+
 
 def _load_signal_timeline(path):
     """Read a generate_timeline.py CSV into a list of phase dicts."""
@@ -361,6 +382,49 @@ def _load_signal_timeline(path):
     if not phases:
         raise ValueError(f"{path} has no phase rows")
     return phases
+
+
+def _read_plan_summary(path):
+    """Row count and hour range from the approval-target PLAN CSV
+    (APPROVAL_TARGET_PATH) - NOT calendar dates: the plan file is an
+    hour-of-week template (0-167, one row per road per hour; see
+    ADR-012's weekly regeneration horizon), not a dated artefact -
+    calendar dates only enter via SIGNAL_TIMELINE_PATH's playback, a
+    deliberately separate, deterministic expansion. Returns None if the
+    file cannot be read or parsed - the approval modal must show that
+    plainly, not crash on a missing or malformed plan.
+    """
+    try:
+        hours = []
+        row_count = 0
+        with open(path, newline="") as fh:
+            for row in csv.DictReader(fh):
+                hours.append(int(row["hour"]))
+                row_count += 1
+    except (OSError, KeyError, ValueError):
+        return None
+    if not hours:
+        return None
+    return {"row_count": row_count, "min_hour": min(hours), "max_hour": max(hours)}
+
+
+def _read_model_provenance(path):
+    """Short summary string built from model_card.json, for the approval
+    modal's display only - never hashed, never part of what is approved.
+    A missing or malformed model card must not block approval or crash
+    the modal; it is exactly the kind of "provenance unavailable" state
+    an operator should be able to see and still make a decision about."""
+    try:
+        with open(path) as fh:
+            card = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return "model_card.json not found"
+    n_estimators = card.get("n_estimators", "?")
+    max_depth = card.get("max_depth", "?")
+    target_mode = card.get("target_mode", "?")
+    split_date = card.get("split_date", "?")
+    return (f"RandomForest, {n_estimators} trees, depth {max_depth}, "
+            f"target={target_mode}, trained before {split_date}")
 
 
 # Arrivals per hour per arm, by hour of day. Real demand: mean Vehicles per
@@ -1073,6 +1137,17 @@ class Simulation:
         # can toggle it live without touching module state.
         self.demand_multiplier = DEMAND_MULTIPLIER
 
+        # Display-only record of who approved the schedule and when, and
+        # the SHA-256 prefix of the file they approved - set by main()
+        # AFTER the approval modal succeeds (Section 15), never read or
+        # written by anything else. Plain None defaults here do not touch
+        # operators.json or require authentication, so constructing
+        # Simulation directly - as every headless test does - stays
+        # exactly as unauthenticated as before this gate existed.
+        self.approved_by = None
+        self.approved_at = None
+        self.approval_sha256_prefix = None
+
     # -- clock --------------------------------------------------------------
     @property
     def hour(self):
@@ -1571,6 +1646,21 @@ class Renderer:
         self.text("SCHEDULE SOURCE", 16, 470, self.f_small, C_MUTED)
         self.text(f"pre-planned, {sched_date} {sched_hour:02d}:00", 16, 488, self.f_small, C_TEXT)
         self.text("signals ignore incidents", 16, 506, self.f_small, C_MUTED)
+        if sim.approval_sha256_prefix:
+            self.text(f"sha256 {sim.approval_sha256_prefix}...", 16, 524,
+                      self.f_small, C_MUTED)
+
+        # Persistent record of who approved the schedule and when
+        # (security/approval.py's ApprovalRecord, appended by main()'s
+        # approval modal before this Simulation ever started). Absent
+        # only in a state that should not exist in the live app - the
+        # modal blocks the loop from being reached at all otherwise -
+        # but headless-constructed Simulations (every test) never set
+        # this, hence the guard rather than assuming it is always set.
+        if sim.approved_by:
+            self.text(f"APPROVED BY {sim.approved_by}", 16, 546,
+                      self.f_small, C_GREEN)
+            self.text(sim.approved_at, 16, 562, self.f_small, C_MUTED)
 
         pygame.draw.rect(sc, C_CARD, (16, 620, 188, 62), border_radius=5)
         self.text("SIM CLOCK", 30, 630, self.f_small, C_MUTED)
@@ -1810,19 +1900,183 @@ class Renderer:
         self.text("press C to close", panel.centerx, 410,
                   self.f_small, C_MUTED, centre=True)
 
+    # -- approval gate (Section 15) ------------------------------------------
+    def draw_approval_modal(self, plan_summary, provenance, sha256_hex, fields,
+                             active_field, attempt_count, error_message,
+                             operators_missing):
+        """Runs BEFORE Simulation() is constructed - see _run_approval_gate.
+        Every value here is read straight from disk (the plan CSV, the
+        model card) or passed in from the modal's own event loop; nothing
+        about a running simulation exists yet for this to touch."""
+        sc = self.screen
+        sc.fill(C_BG)
+
+        box_w, box_h = 560, 460
+        box = pygame.Rect((WIDTH - box_w) // 2, (HEIGHT - box_h) // 2, box_w, box_h)
+        pygame.draw.rect(sc, C_PANEL, box, border_radius=8)
+        pygame.draw.rect(sc, C_MUTED, box, 1, border_radius=8)
+
+        x = box.x + 30
+        y = box.y + 24
+        self.text("SCHEDULE APPROVAL REQUIRED", box.centerx, y, self.f_title, C_TEXT, centre=True)
+        y += 36
+
+        filename = os.path.basename(APPROVAL_TARGET_PATH)
+        self.text(f"File: {filename}", x, y, self.f_small, C_MUTED)
+        y += 20
+        if plan_summary:
+            period_txt = (f"Period: hour {plan_summary['min_hour']}-{plan_summary['max_hour']} "
+                          f"({plan_summary['row_count']} rows, hour-of-week template)")
+        else:
+            period_txt = "Period: UNREADABLE - plan file missing or malformed"
+        self.text(period_txt, x, y, self.f_small, C_MUTED)
+        y += 20
+        self.text(f"Model: {provenance}", x, y, self.f_small, C_MUTED)
+        y += 20
+        sha_txt = (f"SHA-256: {sha256_hex[:16]}..." if sha256_hex
+                   else "SHA-256: UNAVAILABLE - cannot hash plan file")
+        self.text(sha_txt, x, y, self.f_small, C_MUTED)
+        y += 32
+
+        if operators_missing:
+            self.text("No operators registered.", x, y, self.f_med, C_RED)
+            y += 26
+            self.text("Run: python -m security.setup_operator", x, y, self.f_small, C_TEXT)
+            y += 40
+        else:
+            field_w = box_w - 60
+            self.text("Username", x, y, self.f_small, C_MUTED)
+            y += 16
+            u_rect = pygame.Rect(x, y, field_w, 30)
+            pygame.draw.rect(sc, C_CARD, u_rect, border_radius=4)
+            if active_field == "username":
+                pygame.draw.rect(sc, C_BLUE, u_rect, 2, border_radius=4)
+            self.text(fields["username"], u_rect.x + 8, u_rect.y + 7, self.f_small, C_TEXT)
+            y += 40
+
+            self.text("Password", x, y, self.f_small, C_MUTED)
+            y += 16
+            p_rect = pygame.Rect(x, y, field_w, 30)
+            pygame.draw.rect(sc, C_CARD, p_rect, border_radius=4)
+            if active_field == "password":
+                pygame.draw.rect(sc, C_BLUE, p_rect, 2, border_radius=4)
+            self.text("*" * len(fields["password"]), p_rect.x + 8, p_rect.y + 7,
+                      self.f_small, C_TEXT)
+            y += 44
+
+            accept_rect = pygame.Rect(x, y, 140, 36)
+            pygame.draw.rect(sc, C_GREEN, accept_rect, border_radius=5)
+            self.text("ACCEPT", accept_rect.centerx, accept_rect.centery,
+                      self.f_med, C_BG, centre=True)
+            y += 50
+
+            if error_message:
+                self.text(error_message, x, y, self.f_small, C_RED)
+                y += 18
+            if attempt_count > 0:
+                self.text(f"attempts: {attempt_count}", x, y, self.f_small, C_MUTED)
+                y += 18
+
+        self.text("TAB switch field · ENTER submit · ESC quit", box.centerx,
+                  box.bottom - 20, self.f_small, C_MUTED, centre=True)
+
 
 # =============================================================================
 # SECTION 15 - MAIN LOOP
 # =============================================================================
+def _run_approval_gate(clock, renderer):
+    """Blocks until the operator approves the schedule PLAN
+    (APPROVAL_TARGET_PATH) or quits. Returns an ApprovalRecord on
+    success, None if the operator quit (ESC or the window close button)
+    without approving.
+
+    Runs entirely BEFORE Simulation() is constructed in main() below -
+    nothing about the simulation exists yet, so there is nothing this
+    gate could leak into even by accident. Approval gates whether
+    playback STARTS; it has no way to influence schedule content or
+    phase advancement because those objects do not exist while this
+    function is running (see DESIGN RULE at the top of this file and
+    the CONSTRAINT in DECISIONS.md's approval ADR).
+    """
+    plan_summary = _read_plan_summary(APPROVAL_TARGET_PATH)
+    provenance = _read_model_provenance(MODEL_CARD_PATH)
+    try:
+        sha256_hex = sha256_file(APPROVAL_TARGET_PATH)
+    except OSError:
+        sha256_hex = None
+
+    fields = {"username": "", "password": ""}
+    active_field = "username"
+    attempt_count = 0
+    error_message = None
+
+    while True:
+        # Re-checked every frame, not just once at entry, so registering
+        # an operator in another terminal while this modal is open is
+        # picked up on the next ENTER press without restarting.
+        operators_missing = not DEFAULT_CREDENTIALS_PATH.exists()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return None
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    return None
+                elif event.key == pygame.K_TAB:
+                    active_field = "password" if active_field == "username" else "username"
+                elif event.key == pygame.K_BACKSPACE:
+                    fields[active_field] = fields[active_field][:-1]
+                elif event.key == pygame.K_RETURN:
+                    if operators_missing:
+                        error_message = "No operators registered - see setup command below"
+                    elif sha256_hex is None:
+                        error_message = "Cannot hash the plan file - check it exists"
+                    elif not fields["username"] or not fields["password"]:
+                        error_message = "Enter a username and password"
+                    else:
+                        auth = OperatorAuth.load_or_create()
+                        if auth.verify(fields["username"], fields["password"]):
+                            timestamp = datetime.now(timezone.utc).isoformat()
+                            record = ApprovalRecord(
+                                timestamp=timestamp,
+                                username=fields["username"],
+                                schedule_path=str(APPROVAL_TARGET_PATH),
+                                sha256=sha256_hex,
+                            )
+                            append_approval(record)
+                            return record
+                        attempt_count += 1
+                        error_message = "authentication failed"
+                        fields["password"] = ""
+                elif event.unicode and event.unicode.isprintable():
+                    fields[active_field] += event.unicode
+
+        renderer.draw_approval_modal(
+            plan_summary=plan_summary, provenance=provenance, sha256_hex=sha256_hex,
+            fields=fields, active_field=active_field, attempt_count=attempt_count,
+            error_message=error_message, operators_missing=operators_missing,
+        )
+        pygame.display.flip()
+        clock.tick(60)
+
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption(
         "Secure AI-Driven Smart Traffic Control System - Junction Simulation")
     clock = pygame.time.Clock()
+    renderer = Renderer(screen)
+
+    approval = _run_approval_gate(clock, renderer)
+    if approval is None:
+        pygame.quit()
+        return
 
     sim = Simulation()
-    renderer = Renderer(screen)
+    sim.approved_by = approval.username
+    sim.approved_at = approval.timestamp
+    sim.approval_sha256_prefix = approval.sha256[:16]
 
     # Shared by the E/F/G/H/S/K key handlers and the SEC_BUTTONS mouse
     # handler below, so keyboard and mouse trigger the exact same action -

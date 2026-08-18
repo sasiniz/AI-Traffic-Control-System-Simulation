@@ -8,8 +8,12 @@ Run with:  python3 -m pytest security/test_security.py -v
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 from .attacks import FalseDataInjectionAttack, SensorSpoofingAttack
 from .auth import AuthError, OperatorAuth
+from .approval import ApprovalRecord, append_approval, load_latest_approval, sha256_file, verify_still_valid
 from .channel import ChannelRejected, SensorChannel
 from .crypto import DecryptionError, SensorCrypto
 from . import detection
@@ -369,6 +373,81 @@ def test_detection_classify_simultaneity_ignored_during_accident():
         "S4 must not fire while a real accident is active (S4 and not accident)"
 
 
+# ---------------------------------------------------------------------------
+# approval.py -- schedule approval hash binding and append-only log
+# ---------------------------------------------------------------------------
+
+def test_approval_hash_stable_across_repeated_calls():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "plan.csv"
+        path.write_text("hour,road,predicted_count,green_seconds\n0,North,62.09,46\n")
+        h1 = sha256_file(path)
+        h2 = sha256_file(path)
+        assert h1 == h2
+        assert len(h1) == 64, "sha256 hex digest must be 64 characters"
+
+
+def test_approval_hash_changes_on_one_byte_modification():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "plan.csv"
+        path.write_text("hour,road,predicted_count,green_seconds\n0,North,62.09,46\n")
+        before = sha256_file(path)
+        path.write_text("hour,road,predicted_count,green_seconds\n0,North,62.19,46\n")  # one digit changed
+        after = sha256_file(path)
+        assert before != after
+
+
+def test_approval_verify_still_valid_true_before_false_after_modification():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "plan.csv"
+        path.write_text("hour,road,predicted_count,green_seconds\n0,North,62.09,46\n")
+        record = ApprovalRecord(
+            timestamp="2026-08-18T12:00:00Z", username="op1",
+            schedule_path=str(path), sha256=sha256_file(path))
+        assert verify_still_valid(path, record) is True
+
+        path.write_text("hour,road,predicted_count,green_seconds\n0,North,999,46\n")
+        assert verify_still_valid(path, record) is False
+
+
+def test_approval_append_then_load_latest_round_trips():
+    with tempfile.TemporaryDirectory() as tmp:
+        schedule_path = str(Path(tmp) / "plan.csv")
+        log_path = Path(tmp) / "approvals.jsonl"
+        record = ApprovalRecord(
+            timestamp="2026-08-18T12:00:00Z", username="op1",
+            schedule_path=schedule_path, sha256="a" * 64)
+        append_approval(record, log_path=log_path)
+
+        loaded = load_latest_approval(schedule_path, log_path=log_path)
+        assert loaded == record
+
+        # a second, later approval for the same path must become "latest"
+        record2 = ApprovalRecord(
+            timestamp="2026-08-18T13:00:00Z", username="op2",
+            schedule_path=schedule_path, sha256="b" * 64)
+        append_approval(record2, log_path=log_path)
+        assert load_latest_approval(schedule_path, log_path=log_path) == record2
+
+        # the log itself has both lines, append-only
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+
+
+def test_approval_load_latest_returns_none_for_unknown_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "approvals.jsonl"
+        append_approval(
+            ApprovalRecord(timestamp="2026-08-18T12:00:00Z", username="op1",
+                            schedule_path=str(Path(tmp) / "known.csv"), sha256="a" * 64),
+            log_path=log_path)
+        assert load_latest_approval(str(Path(tmp) / "unknown.csv"), log_path=log_path) is None
+
+        # no log file at all is also "no record", not an error
+        assert load_latest_approval(str(Path(tmp) / "known.csv"),
+                                     log_path=Path(tmp) / "does_not_exist.jsonl") is None
+
+
 ALL_TESTS = [
     test_crypto_round_trip,
     test_crypto_rejects_tampered_ciphertext,
@@ -402,6 +481,11 @@ ALL_TESTS = [
     test_detection_classify_ambiguous_when_physical_and_divergence_both_present,
     test_detection_classify_normal_when_nothing_fires,
     test_detection_classify_simultaneity_ignored_during_accident,
+    test_approval_hash_stable_across_repeated_calls,
+    test_approval_hash_changes_on_one_byte_modification,
+    test_approval_verify_still_valid_true_before_false_after_modification,
+    test_approval_append_then_load_latest_round_trips,
+    test_approval_load_latest_returns_none_for_unknown_path,
 ]
 
 

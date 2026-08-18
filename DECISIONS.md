@@ -2031,3 +2031,148 @@ headless runs against the corrected security/detection.py and
 traffic_sim.py. Framerate noise observation: commit 9947df6, both cited
 figures read directly from its own commit message, not restated as new
 measurement.
+
+## ADR-028: Schedule approval gate — hash-bound operator sign-off before playback
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+**Context**
+
+ADR-005 established that the schedule CSV is the single artefact that
+determines signal behaviour, and recorded directly in its own
+Consequences section that this "makes it the artefact that must be
+authenticated, integrity protected and replay protected before
+deployment." auth.py (ADR-023) has existed since that entry, unit tested,
+but never wired into the dashboard - a login proves who clicked ACCEPT,
+but says nothing about WHAT they accepted, and nothing enforced that the
+file on disk at playback time was the same file a human ever looked at.
+
+**Decision**
+
+An approval modal (traffic_sim.py, Section 15) runs in main(), before
+Simulation() is constructed and before any simulation loop step: it
+displays the schedule file name, the period it covers, its row count,
+model provenance read from models/model_card.json, and the first 16 hex
+characters of its SHA-256, then takes a username/password pair and calls
+OperatorAuth.verify(). On success it appends a security/approval.py
+ApprovalRecord (timestamp, username, schedule_path, sha256, decision) as
+one JSON line to security/approvals.jsonl and only then starts the
+simulation; on failure it shows "authentication failed", clears the
+password field, and allows retry with a visible attempt count.
+
+The approval target is APPROVAL_TARGET_PATH = signal_schedule_plan.csv
+(hour, road, predicted_count, green_seconds - the model's direct output),
+NOT SIGNAL_TIMELINE_PATH (the expanded phase-by-phase CSV
+SignalController actually plays back). generate_timeline.py's
+compile_timeline() expands the plan into the timeline deterministically -
+same plan in, same timeline out, every time. Approving the expansion
+would be approving a derived artefact that carries no information the
+plan does not already carry; the plan is the authored artefact a human
+reviewer can meaningfully assess (it is what the model produced), so it
+is what gets hashed and signed off. APPROVAL_TARGET_PATH is written as
+the one line to change when the annual plan
+(data/signal_schedule_plan_annual.csv) replaces the weekly one.
+
+The hash binding is the point, not a formality: per ADR-005, the schedule
+CSV alone determines signal behaviour, so an approval recorded against a
+username with no binding to the exact bytes of that file is an approval
+of nothing in particular - the file could be regenerated, edited, or
+swapped between the click and playback (or between playback and a later
+audit) and the record would not know. sha256_file(path) is recomputed and
+compared, not trusted from a prior run; verify_still_valid(schedule_path,
+record) lets anyone re-check that binding later using only the file on
+disk and the log entry, with no other state required.
+
+ISO 27001 mapping (see security/README.md for the fuller table): A.5.17
+(authentication information) - the username/password pair, stored and
+verified via bcrypt (auth.py, ADR-023), never in this module. A.8.5
+(secure authentication) - failed attempts are rejected with no
+information disclosure beyond "authentication failed" (see the timing-
+safety note in auth.py's verify(), exercised for unknown usernames too -
+this session's Review C3), and the password field is cleared on failure
+rather than left for a shoulder-surfer to read. A.8.24 (use of
+cryptography) - SHA-256 binds the approval decision to the exact bytes
+approved, using the same reasoning already applied to sensor readings in
+ADR-023, now applied to the schedule file itself.
+
+**Alternatives rejected**
+
+Approving SIGNAL_TIMELINE_PATH (the expanded phase timeline) instead of
+the plan. Rejected: it is a deterministic function of the plan, so
+hashing it binds approval to the SAME information the plan's hash already
+carries, at ~30x the file size for no additional integrity guarantee, and
+it invites a reviewer to read tens of thousands of phase rows instead of
+the single weekly table the model actually produced.
+
+Signing the approval (e.g. an operator-held private key) rather than
+hashing plus an authenticated append-only log. Rejected: signing requires
+key generation, distribution, and protection - a PKI this project has no
+mechanism to build or manage, and introducing one just for this control
+would be security theatre, a cryptographic primitive with no supporting
+infrastructure behind it. A SHA-256 hash bound to a username inside an
+append-only log, combined with the existing bcrypt-authenticated login
+that produced the record, achieves the integrity-binding property this
+control needs (was THIS file approved by THIS operator) without
+inventing key management the project does not have.
+
+Storing the approval decision as a mutable field on the schedule file
+itself (e.g. a header row or sidecar flag). Rejected: a mutable field
+sits inside the same trust boundary as the thing being approved - an
+attacker (or an innocent re-generation) that can change the schedule can
+change the flag alongside it. A separate, append-only log outside that
+boundary is what makes "was this approved" a question with an answer
+that survives the schedule file being touched.
+
+**Consequences**
+
+Positive: playback is now gated on a specific, hash-verified file and a
+specific, authenticated human - not merely on a file with the right name
+existing on disk. Constructing Simulation() directly, which every
+headless test does, requires no authentication and touches no
+credential or approval file (confirmed this session, Review C7:
+operators.json's mtime is unchanged across a Simulation() construction).
+The gate is confined to main() and the approval modal function it calls,
+before Simulation exists; grep confirms zero references to approval,
+auth, or sha256 inside SignalController, Vehicle.update, or
+Simulation._leaders (Review C8) - approval gates whether playback starts,
+never schedule content or phase advancement, preserving this file's
+central invariant.
+
+Negative, stated plainly rather than implied away: bcrypt authenticates a
+local operator against a local credential file (security/operators.json,
+gitignored, created only by security/setup_operator.py). There is no
+certificate authority, no session management (the modal re-authenticates
+once at launch and nothing checks the operator is still present or still
+authorised for the rest of the run), and no revocation mechanism - a
+credential, once registered, is valid until someone manually edits
+operators.json. Nothing in this design protects security/approvals.jsonl
+or operators.json against an attacker who already has filesystem write
+access to the machine running the simulation: such an attacker could
+append a forged approval record or a new operator credential directly,
+bypassing the modal entirely. This is sufficient to demonstrate the
+control - authenticated human sign-off bound to a specific artefact,
+logged append-only - for a dissertation project running on one laptop. It
+is not sufficient for a real deployment, which would need centralised
+identity (a CA or equivalent), session-scoped authorisation, credential
+revocation, and a tamper-evident log store outside the reach of local
+filesystem access - none of which exists here and none of which should
+be assumed from this control's presence.
+
+**Sources**
+
+Design decision plus this session's Review C evidence: C1 (correct
+credentials append a record with the right username, path and a 64-
+character hex hash), C2/C3 (wrong password and unknown username both
+rejected, retry offered, attempt count shown, security/approvals.jsonl
+byte-identical before and after - confirmed via direct byte comparison),
+C3's additional check that auth.py's dummy-hash timing-safety branch is
+actually exercised for an unknown username (bcrypt.checkpw call count
+verified as 1 via a call-counting patch), C4 (verify_still_valid True
+before a one-byte modification to the live signal_schedule_plan.csv,
+False after, True again after restoring the original bytes - restoration
+confirmed exact via `git diff --stat` showing no change), C5 (operators.
+json moved aside: no crash, the modal names the setup command, restored
+after), C7 (37/37 tests; Simulation() construction confirmed not to
+touch operators.json), C8 (grep, as above). ADR-005 and ADR-023, quoted
+directly where cited above.

@@ -9,4 +9,5 @@ data/feature_table.csv
 # security module
 .pytest_cache/
 security/operators.json
+security/approvals.jsonl
 security_module.zip
