@@ -1938,6 +1938,8 @@ class Renderer:
         self.text(sha_txt, x, y, self.f_small, C_MUTED)
         y += 32
 
+        u_rect = p_rect = accept_rect = None
+
         if operators_missing:
             self.text("No operators registered.", x, y, self.f_med, C_RED)
             y += 26
@@ -1980,6 +1982,11 @@ class Renderer:
         self.text("TAB switch field · ENTER submit · ESC quit", box.centerx,
                   box.bottom - 20, self.f_small, C_MUTED, centre=True)
 
+        # Returned so _run_approval_gate's mouse hit-testing uses the exact
+        # rects just rendered, not a second hardcoded copy that can drift -
+        # same reasoning as SEC_BUTTONS (Section 1).
+        return u_rect, p_rect, accept_rect
+
 
 # =============================================================================
 # SECTION 15 - MAIN LOOP
@@ -2009,6 +2016,36 @@ def _run_approval_gate(clock, renderer):
     active_field = "username"
     attempt_count = 0
     error_message = None
+    u_rect = p_rect = accept_rect = None
+
+    def _attempt_submit():
+        # Single submit path - both ENTER and a click on accept_rect call
+        # this, so there is exactly one place that can approve a schedule.
+        nonlocal attempt_count, error_message
+        if operators_missing:
+            error_message = "No operators registered - see setup command below"
+            return None
+        if sha256_hex is None:
+            error_message = "Cannot hash the plan file - check it exists"
+            return None
+        if not fields["username"] or not fields["password"]:
+            error_message = "Enter a username and password"
+            return None
+        auth = OperatorAuth.load_or_create()
+        if auth.verify(fields["username"], fields["password"]):
+            timestamp = datetime.now(timezone.utc).isoformat()
+            record = ApprovalRecord(
+                timestamp=timestamp,
+                username=fields["username"],
+                schedule_path=str(APPROVAL_TARGET_PATH),
+                sha256=sha256_hex,
+            )
+            append_approval(record)
+            return record
+        attempt_count += 1
+        error_message = "authentication failed"
+        fields["password"] = ""
+        return None
 
     while True:
         # Re-checked every frame, not just once at entry, so registering
@@ -2027,35 +2064,36 @@ def _run_approval_gate(clock, renderer):
                 elif event.key == pygame.K_BACKSPACE:
                     fields[active_field] = fields[active_field][:-1]
                 elif event.key == pygame.K_RETURN:
-                    if operators_missing:
-                        error_message = "No operators registered - see setup command below"
-                    elif sha256_hex is None:
-                        error_message = "Cannot hash the plan file - check it exists"
-                    elif not fields["username"] or not fields["password"]:
-                        error_message = "Enter a username and password"
-                    else:
-                        auth = OperatorAuth.load_or_create()
-                        if auth.verify(fields["username"], fields["password"]):
-                            timestamp = datetime.now(timezone.utc).isoformat()
-                            record = ApprovalRecord(
-                                timestamp=timestamp,
-                                username=fields["username"],
-                                schedule_path=str(APPROVAL_TARGET_PATH),
-                                sha256=sha256_hex,
-                            )
-                            append_approval(record)
-                            return record
-                        attempt_count += 1
-                        error_message = "authentication failed"
-                        fields["password"] = ""
+                    record = _attempt_submit()
+                    if record is not None:
+                        return record
                 elif event.unicode and event.unicode.isprintable():
                     fields[active_field] += event.unicode
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                # Hit-tests against the rects draw_approval_modal returned
+                # last frame - the same rects currently on screen.
+                if u_rect and u_rect.collidepoint(event.pos):
+                    active_field = "username"
+                elif p_rect and p_rect.collidepoint(event.pos):
+                    active_field = "password"
+                elif accept_rect and accept_rect.collidepoint(event.pos):
+                    record = _attempt_submit()
+                    if record is not None:
+                        return record
 
-        renderer.draw_approval_modal(
+        u_rect, p_rect, accept_rect = renderer.draw_approval_modal(
             plan_summary=plan_summary, provenance=provenance, sha256_hex=sha256_hex,
             fields=fields, active_field=active_field, attempt_count=attempt_count,
             error_message=error_message, operators_missing=operators_missing,
         )
+
+        hovering_accept = accept_rect and accept_rect.collidepoint(pygame.mouse.get_pos())
+        try:
+            pygame.mouse.set_cursor(
+                pygame.SYSTEM_CURSOR_HAND if hovering_accept else pygame.SYSTEM_CURSOR_ARROW)
+        except pygame.error:
+            pass  # no real cursor under a headless/dummy video driver - not fatal
+
         pygame.display.flip()
         clock.tick(60)
 

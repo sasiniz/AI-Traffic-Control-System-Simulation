@@ -448,6 +448,99 @@ def test_approval_load_latest_returns_none_for_unknown_path():
                                      log_path=Path(tmp) / "does_not_exist.jsonl") is None
 
 
+# ---------------------------------------------------------------------------
+# traffic_sim.py -- approval modal ACCEPT click (the mouse-click defect fix)
+# ---------------------------------------------------------------------------
+# _run_approval_gate() and OperatorAuth.load_or_create()/append_approval()
+# (called there with no path arguments) all resolve to this project's real
+# security/operators.json and security/approvals.jsonl by default - there
+# is no injection point to redirect them without touching code outside the
+# approval modal path. This test therefore backs up and restores both real
+# files around itself, the same "move aside, restore after" discipline
+# ADR-028's own Review C5 used for operators.json.
+
+def test_approval_gate_mouse_click_on_accept_submits():
+    """The click path Review C never wrote: a MOUSEBUTTONDOWN at the centre
+    of the rect draw_approval_modal actually rendered for ACCEPT must run
+    the same submit logic ENTER runs, and _run_approval_gate must return
+    the resulting ApprovalRecord."""
+    import os
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    import threading
+    import time
+
+    import pygame
+
+    import traffic_sim
+    from security.auth import DEFAULT_CREDENTIALS_PATH, OperatorAuth
+    from security.approval import DEFAULT_APPROVAL_LOG_PATH
+
+    username, password = "audit_click_operator", "ClickAccept!2026"
+
+    creds_backup = DEFAULT_CREDENTIALS_PATH.read_bytes() if DEFAULT_CREDENTIALS_PATH.exists() else None
+    log_backup = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else None
+
+    try:
+        auth = OperatorAuth.load_or_create()
+        auth.register(username, password, overwrite=True)
+        auth.save()
+
+        if not pygame.get_init():
+            pygame.init()
+        screen = pygame.display.set_mode((traffic_sim.WIDTH, traffic_sim.HEIGHT))
+        renderer = traffic_sim.Renderer(screen)
+        clock = pygame.time.Clock()
+
+        # Layout is static regardless of field contents/active_field, so a
+        # throwaway draw call finds the exact rect the real gate will draw -
+        # this is what tells the test (and a real operator) where to click.
+        _, _, accept_rect = renderer.draw_approval_modal(
+            plan_summary=traffic_sim._read_plan_summary(traffic_sim.APPROVAL_TARGET_PATH),
+            provenance=traffic_sim._read_model_provenance(traffic_sim.MODEL_CARD_PATH),
+            sha256_hex=traffic_sim.sha256_file(traffic_sim.APPROVAL_TARGET_PATH),
+            fields={"username": "", "password": ""}, active_field="username",
+            attempt_count=0, error_message=None, operators_missing=False,
+        )
+        assert accept_rect is not None, "no ACCEPT rect drawn - operators_missing branch taken?"
+
+        # Typed before the gate starts, so it is all drained on frame 1.
+        for ch in username:
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB, unicode="", mod=0))
+        for ch in password:
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
+
+        result = {}
+
+        def _run():
+            result["record"] = traffic_sim._run_approval_gate(clock, renderer)
+
+        gate_thread = threading.Thread(target=_run, daemon=True)
+        gate_thread.start()
+        # Let the typed credentials be drained and at least one modal frame
+        # render, so the click lands on rects the loop has actually drawn -
+        # mirrors a real operator, who can only click what is on screen.
+        time.sleep(0.3)
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, button=1, pos=accept_rect.center))
+        gate_thread.join(timeout=5.0)
+
+        assert not gate_thread.is_alive(), "approval gate did not return after the ACCEPT click"
+        record = result.get("record")
+        assert record is not None, "click on ACCEPT did not submit and return an ApprovalRecord"
+        assert record.username == username
+        assert record.schedule_path == str(traffic_sim.APPROVAL_TARGET_PATH)
+    finally:
+        if creds_backup is None:
+            DEFAULT_CREDENTIALS_PATH.unlink(missing_ok=True)
+        else:
+            DEFAULT_CREDENTIALS_PATH.write_bytes(creds_backup)
+        if log_backup is None:
+            DEFAULT_APPROVAL_LOG_PATH.unlink(missing_ok=True)
+        else:
+            DEFAULT_APPROVAL_LOG_PATH.write_bytes(log_backup)
+
+
 ALL_TESTS = [
     test_crypto_round_trip,
     test_crypto_rejects_tampered_ciphertext,
@@ -486,6 +579,7 @@ ALL_TESTS = [
     test_approval_verify_still_valid_true_before_false_after_modification,
     test_approval_append_then_load_latest_round_trips,
     test_approval_load_latest_returns_none_for_unknown_path,
+    test_approval_gate_mouse_click_on_accept_submits,
 ]
 
 
