@@ -2190,9 +2190,7 @@ class Renderer:
         if plan_summary:
             period_txt = (f"Period: {plan_summary['min_datetime']} to "
                           f"{plan_summary['max_datetime']} "
-                          f"({plan_summary['row_count']} rows, recursive "
-                          f"forecast - see DECISIONS.md's recursive-forecast "
-                          f"and approval-repointing ADRs)")
+                          f"({plan_summary['row_count']} rows, recursive forecast)")
         else:
             period_txt = "Period: UNREADABLE - plan file missing or malformed"
         self.text(period_txt, x, y, self.f_small, C_MUTED)
