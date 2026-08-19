@@ -2872,3 +2872,295 @@ window reuses), ADR-011 (the OVERALL_excl_West convention applied to
 J5), ADR-012 (the horizon reasoning this entry amends), ADR-021 (the
 allocation constants quoted and reused unchanged), ADR-028/ADR-031 (the
 approval gate and review pane this schedule now flows through).
+
+---
+
+## ADR-034: Recursive annual forecast built as a disclosed, separate demo artefact
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Amends ADR-012 and ADR-033's rejection of recursive multi-step
+forecasting as a technique. Does not reverse either entry's underlying
+decision: ADR-012's weekly regeneration horizon stands, and ADR-033's
+choice of `signal_schedule_dated.csv` as the approval target stands
+unchanged - `APPROVAL_TARGET_PATH` is deliberately NOT repointed at the
+artefact this entry describes. This entry adds a second, clearly
+separate, explicitly degraded demonstration artefact alongside both,
+rather than replacing what either decided.**
+
+**Context**
+
+The brief that produced this entry asked, again, for the literal annual
+window ADR-033 already found impossible to build from real data alone
+(`traffic_final_cleaned.csv` ends 2017-06-30 23:00; 2017-07-01 to
+2018-06-30 is entirely past it) - but this time specifying the technique
+ADR-012 and ADR-033 both rejected for it: recursive forecasting, predict
+one step, feed the prediction back in as a lag input, repeat. Both
+earlier entries gave the same reason: error compounds across iterations
+with nothing in this project's scope to bound it.
+
+Told this directly, the operator's instruction was to build it anyway,
+for a specific, stated reason that this entry records rather than
+smooths over: this project has no live weekly-cadence deployment loop.
+ADR-012's real design - regenerate weekly from the most recent real
+data - never needs a lag value more than 168 hours old, because a new
+week of real data arrives before the next schedule is generated. The
+compounding-error problem recursive forecasting creates is therefore a
+property of manufacturing a single, one-off, 8,760-hour demonstration
+file from a dataset that stops 8,592 hours short of covering it - not a
+property of the system ADR-012 actually describes running. Recursive
+forecasting is the only way to produce that literal file without
+retraining (disallowed by this task) or fabricating feature inputs
+outright (rejected in ADR-033 for the same file, on the same grounds
+academic honesty required rejecting it there).
+
+This is a narrower claim than "recursive forecasting is fine here." It
+is "recursive forecasting's cost is fine here, PROVIDED it is measured,
+disclosed in full, and kept out of the approval path" - which is what
+the rest of this entry and `generate_annual_forecast.py` do.
+
+**Decision**
+
+`generate_annual_forecast.py` (new file, independent of
+`generate_timeline.py` and `generate_dated_schedule.py`, neither of
+which is modified) adds a THIRD schedule artefact,
+`signal_schedule_annual.csv`, alongside `signal_schedule_plan.csv` (the
+ADR-012 weekly template) and `signal_schedule_dated.csv` (the ADR-033
+dated schedule) - neither existing file is deleted, overwritten, or
+read by this script. `models/count_model.joblib` is loaded and only
+ever `.predict()`-ed, never `.fit()`-ed, per this task's hard
+constraint.
+
+Two modes, sharing one `recursive_forecast()` function:
+
+`--mode deliverable` seeds on all real data through 2017-06-30 23:00 and
+forecasts recursively to 2018-06-30 23:00 (the literal window originally
+requested), in 168-hour blocks - the exact size at which
+lag_168/lag_336/roll_168_lag168 stay legal within a block (ADR-015),
+so no block ever needs a value from later in itself. Each block's own
+predictions are appended to the per-road history buffer before the next
+block is computed. Verified this session: 35,040 rows exactly (8,760
+hours x 4 roads), first datetime 2017-07-01T00:00:00, last
+2018-06-30T23:00:00.
+
+`--mode validation` seeds on real data through 2016-12-31 23:00 only -
+deliberately withholding the six months of real data that follow - and
+forecasts the same way across 2017-01-01 to 2017-06-30, where real
+actuals already exist (ADR-008's held-out test period), then compares.
+This is the only source of evidence for how fast the recursion's error
+actually grows on this dataset; `--mode deliverable` alone would produce
+35,040 numbers with no way to judge them.
+
+Green seconds are computed by the SAME, unmodified `allocate_green()`
+(ADR-021: `CYCLE_SECONDS=120`, `MIN_GREEN_SECONDS=12`,
+`AVAILABLE_GREEN=108`, largest-remainder rounding), imported from
+`generate_timeline.py`, not reimplemented. Verified this session: every
+one of the 8,760 hours in the deliverable file sums its four
+`green_seconds` to exactly 108 (zero exceptions), and the observed
+minimum green across all 35,040 rows is 14s, above the 12s floor.
+
+**The changeover from real to predicted lags, STEP 0(b) computed and
+this session confirmed exactly:** `lag_168` and `roll_168_lag168` both
+resolve to real data only while `hour - 168h <= 2017-06-30 23:00`, i.e.
+for the first 168 hours of the forecast window (2017-07-01 00:00
+through 2017-07-07 23:00). At 2017-07-08 00:00, `lag_168` needs
+`Vehicles[2017-07-01 00:00]`, which is itself a prediction. Verified:
+`lags_real=true` for exactly 672 of 35,040 rows (168 hours x 4 roads);
+`lags_real=false` for the remaining 34,368 rows (8,592 hours), with the
+changeover falling exactly at 2017-07-08T00:00:00 as computed. 98.1% of
+the deliverable file's hours are therefore forecasts of forecasts to
+some depth, not single-step predictions from real inputs.
+
+**The diff-to-level reconstruction, verified against the actual model
+class rather than assumed:** `model_wrapper.DiffTargetRandomForest`
+trains on `Vehicles - lag_168` and its `.predict()` returns
+`diff_pred + X["lag_168"]` internally - the diff representation never
+crosses the class boundary, so `recursive_forecast()` calls `.predict()`
+once per block and receives vehicle counts directly. The running level
+is carried forward by appending each block's own `predicted_count`
+values into the same per-road history buffer used to compute
+`lag_168`/`lag_336`/`roll_168_lag168` for the next block, exactly as if
+they were real `Vehicles` rows (`Outlier_Flag=False`,
+`Synthetic_Segment_Unverified=False` - they are forecasts, not part of
+the ADR-002 synthetic segment). Hand-verified this session, independent
+implementation, first 5 hours x 4 roads (20 values): e.g. East hour 0,
+`lag_168` anchor 16, `diff_pred` 3.3348, hand-computed
+`16 + 3.3348 = 19.3348`, matching the script's own CSV output to 1e-6.
+All 20 values matched exactly.
+
+**West inherits the ADR-002 synthetic segment, stated plainly:** the
+seed history (all of `traffic_final_cleaned.csv`, since `--mode
+deliverable` seeds through 2017-06-30) carries 10,248 West rows marked
+`Synthetic_Segment_Unverified=True` (70% of West's 14,592 rows; East,
+North, South carry zero), confirmed by direct count this session. West's
+`lag_336` reaches back up to 336 hours from the forecast's first block,
+which for early forecast hours can still land inside real West data
+(the synthetic segment ends 2017-01-01, well before the seed cutoff), so
+West's very first predictions are not synthetic-derived - but every
+West prediction from block 2 onward (2017-07-08 onward) is built in
+part from a history buffer whose own deep history includes that
+synthetic segment, the same way any West-derived quantity in this
+project does. This is not a new problem this entry creates; it is the
+existing ADR-002 disclosure propagating into a new artefact, and is
+recorded here so a reader of `signal_schedule_annual.csv` alone, without
+also having read ADR-002, is not misled about what "West" means in this
+file.
+
+**K6, the degradation measurement, in full (validation protocol, MAE,
+OVERALL_excl_West per ADR-011):**
+
+    Week   Hours (horizon)      East    North   South    West   OVERALL_excl_West
+    1      1-168                8.299    6.806   2.558   2.340   5.888
+    2      169-336              3.682   12.522   3.405   1.716   6.536
+    4      505-672              4.257   11.108   3.822   1.963   6.395
+    8      1177-1344           12.611   13.405  10.088   2.204  12.035
+    13     2017-2184            6.290   10.130  10.927   1.818   9.116
+    26     4201-4344 (partial)  5.760   24.764  13.816   3.170  14.780
+
+Week 26 / week 1 ratio, OVERALL_excl_West: 14.780 / 5.888 = **2.51x**.
+Stated as measured: this is under the 3x threshold this project uses
+elsewhere to call an effect large, so it is reported as a real but
+moderate degradation, not a collapse - and the per-road breakdown shows
+it is not evenly spread. North (the busiest road, and the one ADR-020
+already flagged as the road the model most often loses on) degrades
+worst and least steadily, 6.806 at week 1 rising to 24.764 at week 26,
+a 3.6x rise on North alone even though the excl-West blend stays under
+3x. East and West stay comparatively stable across the full six months
+measured. The curve is not monotonic (week 8 is a local peak above week
+13), which the committed plot at
+`results/recursive_degradation_mae_by_horizon.png` shows directly -
+flagged REQUIRES HUMAN READ in `results/RECURSIVE_DEGRADATION.md`
+itself, per this project's own rule (ADR-017) that a plot's shape needs
+a human read and cannot be cleared by a numeric check alone.
+
+**K7, sanity check against the real same-season period, also measured
+this session:** deliverable-file `predicted_count` per road across all
+8,760 hours, against real `Vehicles` for 2016-07-01 to 2017-06-30:
+
+    Road    Forecast min/max/mean       Real min/max/mean
+    East      5.7 /  44.0 / 16.2         1 / 180 / 16.1
+    North    14.0 /  83.3 / 51.9         5 / 156 / 56.1
+    South     7.4 /  27.5 / 14.0         1 /  48 / 17.1
+    West      3.4 /  24.1 /  7.2         1 /  36 /  7.3
+
+The forecast neither collapses to a flat line (every road keeps a wide
+min-max spread relative to its mean) nor diverges unboundedly. What it
+does show plainly: means stay close to the real same-season figures on
+every road, but the extremes are compressed, most visibly on East
+(real max 180, forecast max 44) and North (real max 156, forecast max
+83). East is the "spiky" road (ADR-015, ADR-020) precisely because
+Random Forest averaging helps there against genuine volatility;
+recursive forecasting compounds exactly that averaging tendency across
+53 successive blocks, so the file systematically underrepresents spike
+events on the roads whose real behaviour is spikiest. This is the same
+tree-cannot-extrapolate-and-averages-toward-the-mean mechanism ADR-012
+and ADR-013 already documented for a single-step prediction; recursion
+does not introduce a new failure mode, it repeatedly re-applies the
+existing one.
+
+**What horizon this supports, deployment versus presentation:** the
+measured degradation (2.51x over 26 weeks, non-monotonic, North alone
+at 3.6x) says the first 1-4 weeks of `signal_schedule_annual.csv` carry
+error broadly comparable to the model's already-recorded single-step
+performance (`model_card.json`'s rolling-protocol test MAEs), while
+error beyond roughly 8-13 weeks is measurably worse and, on North
+specifically, close to doubling again by week 26. None of this file is
+fit to deploy: ADR-033's own dated schedule already covers the model's
+one genuinely-evaluated real-data horizon (six months, single-step, no
+recursion), and stands as the artefact this project would actually
+put behind an approval gate. `signal_schedule_annual.csv` exists to
+demonstrate, for a written report, what an annual artefact built this
+way looks like and costs - a presentation artefact with its cost
+measured and disclosed, not a deployment candidate. `APPROVAL_TARGET_PATH`
+is left unchanged for exactly this reason.
+
+**Alternatives rejected**
+
+Retraining the model on a schedule that would let it predict a full
+year natively. Disallowed by this task's own constraints (`models/count_model.joblib`
+is used as-is); also does not solve the underlying problem, since
+ADR-012 already established that dropping the illegal lag features to
+reach an annual-legal feature set collapses North's accuracy (calendar-only
+MAE 15.10 against 4.25) - retraining for a longer native horizon would
+have to make the same trade.
+
+Direct multi-horizon modelling - training a separate model per forecast
+step (or per week) so no step ever consumes another step's own output.
+Standard alternative to recursive forecasting (Hyndman & Athanasopoulos,
+"Forecasting: Principles and Practice", 2nd ed., section 11.3, on
+recursive versus direct multi-step strategies: direct strategies avoid
+error accumulation but require training - and thus a labelled target -
+per horizon, and typically show higher variance per individual step).
+Rejected here for the same reason as retraining: this task disallows
+retraining, and 52 separately-trained per-week models is retraining by
+another name.
+
+Fabricating or imputing feature values for the missing window instead
+of forecasting them. Already rejected once in ADR-033 for this literal
+window, on academic-honesty grounds this entry does not revisit or
+weaken.
+
+Building the artefact without a `--mode validation` degradation
+measurement, on the reasoning that recursive forecasting's cost is
+"well known" in the abstract. Rejected: this project's own standing
+rule (`CLAUDE.md`, DECISIONS.md throughout) is that a difference is not
+negligible, and a technique is not costed, until it is actually
+measured on this data - the 2.51x figure, and North's non-uniform 3.6x
+within it, are both real findings this session would not otherwise
+have on record.
+
+**Consequences**
+
+Positive: the artefact and its cost are both on record.
+`generate_annual_forecast.py`'s `--mode validation` path is the only
+thing in this project that has ever measured how recursive error grows
+on this dataset, and the figure is disclosed in full rather than
+asserted from general principle. Full suite unaffected: 43/43 (K9,
+unchanged from before this session - `traffic_sim.py` was not touched).
+Scoped grep (K10): zero hits for `forecast`, `recursive`, `annual`,
+`predict` on executable lines inside `SignalController`,
+`Vehicle.update`, or `Simulation._leaders` (line ranges 697-770,
+1003-1052, 1312-1383 respectively) - guaranteed by construction, since
+this entry's code changes touch no file `traffic_sim.py` imports from
+or is read by.
+
+Negative, disclosed rather than smoothed over: this is now a THIRD
+schedule-generation code path
+(`generate_timeline.py`/`generate_dated_schedule.py`/
+`generate_annual_forecast.py`), sharing `allocate_green()`, `ROTATION`,
+`CYCLE_SECONDS` and `MODEL_PATH` by import, but each building its own
+rows independently - a future change to shared allocation logic must be
+checked against all three, not just the two ADR-033 already flagged
+this risk for.
+
+Negative: this entry does NOT fully resolve the tension it opens with.
+The operator's own stated reasoning - that ADR-012's real weekly-cadence
+deployment never hits this problem - is sound for the deployed system,
+but `signal_schedule_annual.csv` itself still exists on disk, still
+looks like a schedule file, and nothing at the file-format level
+distinguishes it from `signal_schedule_dated.csv` to a reader who has
+not also read this entry. Keeping `APPROVAL_TARGET_PATH` off it is a
+control at the traffic_sim.py boundary, not a mark on the file itself;
+a future session extending the approval gate's file-selection logic
+must re-read this entry before doing so, not assume any schedule CSV in
+the repository is fit for that gate by default.
+
+**Sources**
+
+R. J. Hyndman and G. Athanasopoulos, "Forecasting: Principles and
+Practice," 2nd ed. Melbourne: OTexts, 2018, section 11.3, "Some practical
+forecasting issues" / recursive vs. direct multi-step forecasting
+strategies.
+This session's STEP 0 (feature legality table, changeover computation,
+diff-target arithmetic hand-check, synthetic-segment count - all
+computed before `generate_annual_forecast.py` was written) and Reviewer
+K1-K11 evidence, run against the real generated `signal_schedule_annual.csv`
+and `results/RECURSIVE_DEGRADATION.md`. ADR-002 (the West synthetic
+segment this entry's West section discloses), ADR-008 (the temporal
+split validation mode reuses), ADR-011 (the OVERALL_excl_West
+convention applied to K6/K7), ADR-012 and ADR-015 (the horizon and
+feature-legality reasoning this entry amends), ADR-017 (the plot-needs-a-human-read
+rule applied to K11), ADR-020 (`model_card.json`'s recorded single-step
+test MAEs, referenced for the deployment-vs-presentation comparison),
+ADR-021 (the allocation constants quoted and reused unchanged), ADR-033
+(the dated-schedule decision this entry amends but does not reverse).
