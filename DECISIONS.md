@@ -3287,3 +3287,241 @@ that future caller reads this entry first.
 
 None, design decision. L1-L5 evidence produced this session against the
 real `write_log()` and the real `results/runs/` directory.
+
+---
+
+## ADR-036: Approval gate repointed at the recursive annual forecast
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Completes what ADR-034 deliberately left disconnected: ADR-034 built
+`signal_schedule_annual.csv` and stated in its own Consequences section
+that `APPROVAL_TARGET_PATH` was "left unchanged for exactly this
+reason" - because the artefact's cost (recursive error compounding
+past the real data) had just been measured and disclosed, not yet
+decided upon as approvable. This entry is that decision, made
+explicitly by the operator with ADR-034's disclosure already in hand,
+not a silent reversal of it.**
+
+**Context**
+
+The previous session built `signal_schedule_annual.csv` (ADR-034) and
+recorded, in the same entry, a deliberate choice not to point
+`APPROVAL_TARGET_PATH` at it - preserving ADR-033's argument that a
+schedule "which cannot honestly carry that weight should not be built
+merely because it was asked for", and noting explicitly that
+`signal_schedule_annual.csv` "exists to demonstrate ... what an annual
+artefact built this way looks like and costs - a presentation artefact
+with its cost measured and disclosed, not a deployment candidate."
+
+This session's brief asked for exactly that repoint, framed as
+something "skipped" in the previous session rather than a decision to
+be reconsidered. It is recorded here as a reconsideration, because
+that is what actually happened: the operator was shown the 2.51x
+week26/week1 MAE figure and ADR-034's full reasoning in the prior
+session's own summary, and asked for the repoint anyway, in a
+follow-up message specifically referencing that summary ("APPROVAL_TARGET_PATH
+still points at signal_schedule_dated.csv, so the modal shows the
+wrong file"). This entry treats that as informed operator authority
+over their own project - the same authority ADR-034 itself rested on
+when it built the artefact in the first place - not as license to skip
+restating the caveat. The caveat is restated below rather than dropped.
+
+**Decision**
+
+`APPROVAL_TARGET_PATH` (traffic_sim.py) now points at
+`signal_schedule_annual.csv` instead of `signal_schedule_dated.csv`.
+Neither `signal_schedule_dated.csv` nor `signal_schedule_plan.csv` is
+deleted or modified - both remain on disk, byte-identical before and
+after this change (verified this session, M5: sha256
+`04e5b7f4...b7074` for the plan and `044d5606...d9b53` for the dated
+schedule, unchanged on both sides).
+
+The approval modal's period line no longer cites "ADR-008 held-out
+test period" - that citation described the dated schedule and is false
+of the annual forecast - and instead states the annual file's real
+date range, row count and the words "recursive forecast", all read
+live from the file via the existing `plan_summary` mechanism (never
+hardcoded - `_plan_summary_from_rows` already computed
+`min_datetime`/`max_datetime`/`row_count` from the parsed bytes before
+this change; only the surrounding wording changed).
+
+`_parse_plan_rows` required an actual code change beyond the two lines
+the brief specified, and this entry records why rather than treating
+it as out of scope: `signal_schedule_annual.csv` (`generate_annual_forecast.py`'s
+output) has columns `datetime, road, predicted_count, green_seconds,
+lags_real` - no `hour_of_week`, which `signal_schedule_dated.csv`
+(`generate_dated_schedule.py`'s output) has and the old parser read
+unconditionally (`row["hour_of_week"]`). That is a hard `KeyError` on
+every row of the annual file. `_run_approval_gate` already catches
+`(KeyError, ValueError)` around this call and substitutes an EMPTY
+plan rather than crashing - which means, without this fix, the repoint
+would not have failed loudly. It would have rendered a modal with no
+review pane and a scroll gate trivially already satisfied (`max_scroll
+== 0` for zero rows), silently removing the review step entirely while
+looking superficially like a working gate. `hour_of_week` is now read
+with `.get()` and stored as `None` when absent; nothing downstream of
+the parse (`_pivot_plan_rows`, `_plan_summary_from_rows`, the modal
+itself) ever used the field, so this has no other effect. This is
+recorded as a finding in its own right: an "only these two lines"
+instruction met a schema difference between the two generators that
+neither this session's brief nor ADR-034 had surfaced, and the
+project's own existing exception handling would have hidden the
+resulting failure rather than exposing it.
+
+**Review evidence, M1-M6, all against the real files:**
+
+M1 (REQUIRES HUMAN READ - screenshots at `results/approval_modal_annual_top.png`
+and `results/approval_modal_annual_end.png`; every assertion the
+images make, stated in plain text so a human reader can check each one
+independently rather than trusting the caption: the top screenshot
+shows "File: signal_schedule_annual.csv", "Period: 2017-07-01T00:00:00
+to 2018-06-30T23:00:00 (35040 rows, recursive forecast - see
+DECISIONS.md's recursive-forecast and approval-repointing ADRs)",
+"PIVOTED VIEW - 8760 dated hourly rows (from 35040 underlying
+datetime/road rows)", a table beginning at row 2017-07-01T00:00:00,
+a status line reading "rows 1-14 of 8760", a disabled grey ACCEPT
+button, and a visible "END: jump to last row" button; the end
+screenshot, captured after programmatically setting `scroll_offset` to
+the final page and `scrolled_to_end=True`, shows the same period line,
+a table ending at row 2018-06-30T23:00:00, a status line reading "rows
+8747-8760 of 8760  - end reached" in green, an enabled green ACCEPT
+button, and no "END: jump to last row" button (hidden once the gate is
+already satisfied, per existing behaviour predating this session). A
+human read is required because a numeric check cannot confirm the
+button colours, the button's presence/absence, or that the rendered
+text is legible and not overlapping - the same limitation ADR-017 and
+ADR-033 already stated for this project's other plots and panes.
+
+M2: SHA-256 shown in the modal (truncated to 16 hex chars for display:
+`9ab4100c95934d30...`) equals the independently computed sha256 of
+`signal_schedule_annual.csv`: `9ab4100c95934d3065dcf27fee6c19e9cde8e295cd37f3da4c3b1d31e9efba9e`
+on both sides, computed twice (once inside the modal-rendering script,
+once via a separate `sha256sum signal_schedule_annual.csv` shell
+invocation reading the file fresh) - not one computation trusted twice.
+
+M3: verified by the three existing approval-gate flow tests in
+`security/test_security.py`, none of which needed changes, now
+exercising the annual file (8760 pivoted rows, not the dated file's
+4344) because they read `APPROVAL_TARGET_PATH` rather than a hardcoded
+path: `test_approval_gate_accept_refused_before_scrolled_to_end`
+(ACCEPT refused via both a click and ENTER before scrolling,
+`approvals.jsonl` unchanged by the refusal, then accepted after END),
+`test_approval_gate_home_after_end_keeps_scroll_ratchet` (HOME after
+END does not re-disable ACCEPT), and
+`test_approval_gate_mouse_click_on_accept_submits` (the click path).
+All three passed against the repointed target.
+
+M4: a real approval run (temporary operator
+`audit_repoint_verification`, `operators.json` and `approvals.jsonl`
+backed up before and restored after, the same discipline
+`security/test_security.py`'s own gate tests use, so this session's
+verification run does not sit permanently in the same audit trail as
+the operator's genuine approvals already on record for the plan and
+dated schedules) appended:
+`{"timestamp":"2026-08-19T13:17:43.582898+00:00","username":"audit_repoint_verification","schedule_path":"E:\\BSc Project Task\\Simulation\\signal_schedule_annual.csv","sha256":"9ab4100c95934d3065dcf27fee6c19e9cde8e295cd37f3da4c3b1d31e9efba9e","decision":"approved"}` -
+`schedule_path` names `signal_schedule_annual.csv`, and `sha256`
+matches M2's value exactly.
+
+M5: see Decision, above - both protected files byte-identical
+before/after.
+
+M6: full suite 43/43, same total as every prior session this project
+has recorded (one test's hardcoded row-count/datetime assertions were
+updated to match the new target - see Alternatives rejected below for
+why this counts as fixing the test to match reality rather than
+scope creep).
+
+**The horizon caveat, restated rather than left implicit now that this
+artefact sits behind the approval gate:** ADR-034 measured, on the
+model's real held-out data, that recursive forecast error grows
+2.51x from week 1 to week 26 (OVERALL_excl_West MAE 5.888 to 14.780),
+non-monotonically, with North alone reaching a 3.6x rise (6.806 to
+24.764) within that same window. `signal_schedule_annual.csv` is now
+the file an operator authenticates against and a `git_commit`/
+`schedule_sha256` pair in `sensor_log.csv`'s provenance header can
+point to as "approved" - which means the honest boundary ADR-034 drew
+between deployment and presentation now needs to be carried by the
+approval act itself, not by which file happened to be sitting behind
+the gate. An operator approving this file is approving a schedule
+whose first 1-4 weeks carry error broadly comparable to the model's
+already-recorded single-step performance, and whose later weeks -
+most visibly on North - carry measurably more. Approving it is not, on
+its own, evidence that this project considers a full year of
+recursively forecast green time safe to actually run a real junction
+on; it is evidence that the approval gate, the hash binding, and the
+scroll-gated review pane all function correctly at this artefact's
+scale, which is what this session's M1-M6 evidence demonstrates.
+
+**Alternatives rejected**
+
+Also updating `_run_approval_gate` or `draw_approval_modal` to display
+`lags_real` or the degradation figures directly in the modal, so the
+caveat above is visible to an operator at approval time rather than
+only in `DECISIONS.md`. Not implemented this session: the brief
+specified exactly two changes to `traffic_sim.py` (the path constant
+and the period line wording) plus whatever was necessary to make them
+function, and the `_parse_plan_rows` fix already went one line past
+that specification out of necessity, not choice. Surfacing the
+degradation figure in the modal itself would be a reasonable
+follow-up and is recorded here as a real gap: an operator working from
+the modal alone, without having read this ADR, sees "recursive
+forecast" but not the 2.51x figure or which weeks it applies to.
+
+Leaving the test suite's hardcoded 17376/4344/dated-period assertions
+unchanged and accepting a failing test as the honest cost of the
+repoint. Rejected: those assertions were never a check on THIS file's
+correctness, only a regression check that `_pivot_plan_rows` preserves
+row count and endpoint data against whatever `APPROVAL_TARGET_PATH`
+currently is - the same relationship holds for the annual file (`8760
+= 35040 / 4`), just with different numbers, so updating the numbers
+keeps the same test meaningful rather than weakening it.
+
+**Consequences**
+
+Positive: the approval gate, hash binding and scroll-gated review pane
+are now demonstrated working at 8760 pivoted rows / 35040 underlying
+rows - roughly double the row count ADR-033's own repoint exercised
+(4344 / 17376) - with no changes needed to the gate's core logic
+itself, only to how the plan file is parsed and described. This is
+some evidence, though not conclusive, that the gate's design
+(hash-over-exact-bytes, pivot-from-parsed-rows, scroll-ratchet) scales
+to at least this size without new failure modes.
+
+Negative: `signal_schedule_dated.csv` - the artefact ADR-033 built
+specifically because it could honestly carry the approval gate's
+weight, entirely real data, no recursion, no compounding error - is no
+longer what the gate protects. It still exists, still passes its own
+tests, and remains available to any script or future session that
+reads `APPROVAL_TARGET_PATH`'s sibling file directly rather than
+through the constant, but a reader who only observes what the running
+program approves will now see the recursively forecast file, not the
+fully-real one. This is the actual, material consequence of the
+repoint, stated plainly rather than only implied by "the modal now
+shows the annual file."
+
+Negative: this is the second time in two sessions `APPROVAL_TARGET_PATH`
+has moved (ADR-033 -> dated schedule, this entry -> annual forecast).
+A future reader of `traffic_sim.py` alone, without DECISIONS.md, has no
+way to know this constant has a history of being repointed for
+disclosed, deliberate reasons rather than by accident - the inline
+comment at its definition now names both this entry and ADR-034 to
+mitigate that, but does not eliminate the risk that a third repoint
+happens without equivalent disclosure.
+
+**Sources**
+
+The previous session's own final summary to the operator (which stated
+`APPROVAL_TARGET_PATH` was "deliberately NOT rewired... since that's
+the piece ADR-033 specifically argued against") and this session's
+follow-up instruction responding to it directly - both are the record
+of this being an informed reconsideration, not a silent reversal.
+ADR-033 (the decision this entry moves the target away from, without
+reversing ADR-033's own reasoning, which concerned the dated schedule
+on its own merits). ADR-034 (the recursive forecast, its degradation
+measurement restated above, and its own explicit statement that the
+approval target was left unchanged pending exactly this kind of
+decision). M1-M6 evidence produced this session against the real
+`signal_schedule_annual.csv`, the real approval modal, and the real
+(backed-up-and-restored) `security/operators.json` and
+`security/approvals.jsonl`.
