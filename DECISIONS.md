@@ -2495,3 +2495,169 @@ This session's STEP 0 (header and row-count confirmation against
 signal_schedule_plan.csv) and Review E1-E4, E6, E7 evidence. ADR-028,
 whose `_attempt_submit()` single-submit-path design this change extends
 rather than duplicates.
+
+## ADR-032: Provenance header on sensor_log.csv, and always writing a file
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+**Context**
+
+ADR-029 recorded that sensor_log.csv reaches disk as plaintext. A separate
+problem exists one level up from confidentiality: even a fully readable
+sensor_log.csv carried no indication of which commit produced it, which
+schedule was running, whether it had been approved, or whether the
+encryption toggle or an attack button had been touched during the run. A
+reader - a supervisor, an examiner, a future session picking the file up
+cold - had no way to tell a fresh, honest run from a stale file left over
+from an earlier one, or from a run where an attack was fired and then
+cleared before quitting. `write_log()` also returned silently when
+`self.log_rows` was empty (`ENABLE_LOGGING = False`, or a run quit before
+the first `LOG_INTERVAL_S`), which meant a zero-row run left whatever file
+was already on disk untouched - a stale file with no marking that it was
+stale.
+
+**Decision**
+
+`write_log()` now always writes a file, and prefixes it with a provenance
+block - one `# key: value` line per field, so the file still parses as CSV
+via `pandas.read_csv(path, comment='#')` (verified this session, G8: row
+count and first/last rows identical between `pandas` and the in-memory
+`log_rows` list). Fields: `run_started_utc`, `run_started_local`,
+`run_ended_utc`, `simulated_duration_s`, `rows_written`, `git_commit`,
+`git_tree`, `schedule_file`, `schedule_sha256`, `approved_by`,
+`approved_at`, `encryption_at_end`, `encryption_toggled_during_run`,
+`attacks_fired`, `demand_multiplier`, `density`. Every field is either a
+real value or the literal string `"unavailable (reason)"` - never a blank
+line, never the Python string `"None"` - so a reader can tell "this field
+could not be determined, here is why" apart from "this field was silently
+dropped".
+
+The zero-row branch was changed from an early `return` to writing the
+provenance header plus the CSV column header with zero data rows and
+`rows_written: 0`. A run that recorded nothing now produces a file that
+visibly says so, rather than leaving a previous run's file in place with
+nothing to distinguish it from a fresh one.
+
+Two fields needed new, minimal state on `Simulation`, added exactly where
+the brief allowed and nowhere else: `self.encryption_toggled` (set `True`
+the first time the E key / ENCRYPT button fires, in `main()`'s
+`_toggle_encryption()`) and `self.attacks_fired` (a set, added to by
+`_make_false_data_attack()`/`_make_spoof_attack()`, both already-named
+functions in `main()` that needed one line each, not new plumbing).
+Neither restructures the toggle or attack code; both are bookkeeping
+alongside it.
+
+**Why an unlabelled evidence file cannot be shown as evidence:** a
+dissertation, a viva, or a supervisor meeting will want to point at
+sensor_log.csv and say "this is what the system recorded." Before this
+change, that sentence was unverifiable from the file alone - nothing in it
+said which code produced it, whether the schedule behind it was ever
+approved, or whether the run included an attack demonstration or was
+clean baseline traffic. A file that cannot answer "which run is this" is
+not usable as evidence of anything specific; at best it is evidence that
+some run happened at some point under some configuration. The provenance
+header exists to make sensor_log.csv self-describing enough to cite.
+
+**Why `encryption_toggled_during_run` exists as a field distinct from
+`encryption_at_end`:** `encryption_at_end` alone cannot distinguish "this
+run was clean the whole time" from "this run had encryption off for
+attack demonstration purposes and was switched back on right before
+quitting" - both end in the same state. The two together answer two
+different, both useful, questions: what was the state when the run ended,
+and did the state change at all during the run. A reader checking whether
+a false-data-injection demo actually ran with encryption off at some point
+needs the second question answered, not just the first.
+
+**Why the zero-row branch was changed:** the old early-`return` behaviour
+meant a viewer could open sensor_log.csv, see a well-formed file with
+plausible-looking rows, and have no way to know those rows were written
+minutes or days ago by a different run, not the one just quit. Silently
+preserving stale output under the name of a run that produced nothing is
+worse than an empty file, because an empty file at least prompts the
+question "why is this empty," while a stale-but-plausible file prompts no
+question at all.
+
+**The limitation, stated plainly:** the provenance header is self-reported
+by the same program that wrote the data below it. Nothing computes a
+checksum over the header, nothing signs it, and nothing prevents a text
+editor from changing `git_commit` or `attacks_fired` after the fact. This
+is categorically different from ADR-028's approval record, which is
+hash-bound to the exact bytes of a separate file and independently
+re-checkable via `verify_still_valid()` using nothing but the file on disk
+and the append-only log entry. The provenance header answers "what does
+this program claim about the run that produced this file"; it does not
+answer, and must never be presented as answering, "can this claim be
+trusted against tampering." Any future use of sensor_log.csv as
+tamper-evident evidence - as opposed to descriptive metadata - would need
+the same hash-binding treatment ADR-028 gave the schedule file, not an
+extension of this header.
+
+**Alternatives rejected**
+
+Per-run timestamped filenames (e.g. `sensor_log_2026-08-19T100459Z.csv`)
+instead of a fixed `LOG_PATH` that is overwritten every run. Rejected:
+this was explicitly out of scope for this change (`LOG_PATH` and the `"w"`
+open mode were both marked do-not-touch), and rejected on merit too - a
+growing pile of per-run files still leaves each individual file exactly as
+unlabelled as before unless it also carries a provenance header, so the
+header is the change that actually solves the problem; a naming scheme
+without it would only rename the same gap.
+
+Splitting traffic telemetry from security audit evidence into two files -
+one plain CSV of sensor readings for traffic analysis, one separately
+secured file (hash-bound, or encrypted at rest per ADR-029's deferred
+work) carrying run provenance and attack/approval history. This is
+recorded as the deployment-grade design and was deliberately not built at
+this scale: a real installation would not want a security audit trail
+sharing a write path, a schema, or a trust level with routine traffic
+counts, and would want the audit file access-controlled separately from
+data an ordinary traffic engineer might read. Building that split, plus
+the access control it implies, was judged disproportionate to a
+single-file, single-machine student project four days from submission. A
+single provenance-headed CSV is the scope-appropriate version of the same
+idea: labelled, not access-separated.
+
+**Consequences**
+
+Positive: verified this session (Reviewer G1-G10). G1: all 16 fields
+populated on a real headless run, none blank or `"None"`. G2: `git_commit`
+matches `git rev-parse --short HEAD` exactly; `git_tree` observed as
+`clean` against a genuinely unmodified tree at commit 0eb17ac and as
+`dirty` after a real one-line change to a tracked file, restored exactly
+afterward - both states observed directly, not inferred. G3:
+`encryption_toggled_during_run` reads `yes` only on a run where the toggle
+fired, `no` otherwise, with `encryption_at_end` independently correct in
+both. G4: `attacks_fired` names a fired attack and reads `none` when
+nothing fired. G5: `demand_multiplier`/`density` match the live
+`Simulation.demand_multiplier` and its `DENSITY_BUTTON_LABELS` entry
+exactly. G6: a decoy file with recognisable prior content is fully
+replaced by a zero-row provenance-and-header-only file, never left
+untouched. G7: `schedule_sha256` and `approved_by` in the header match the
+corresponding fields of the actual last line appended to
+`security/approvals.jsonl` by a real run of `_run_approval_gate`. G8: the
+pandas comment-parsing round trip is exact. G9: 42/42 tests pass (40
+before this change, 2 added: the pandas round-trip and the zero-row decoy
+replacement). G10: zero hits for `log`, `provenance`, `git`, `commit`,
+`approved`, `encryption_toggled` on executable lines inside
+`SignalController` (686-753), `Vehicle.update` (992-1036) or
+`Simulation._leaders` (1301-1370) - the only near-hits were the ordinary
+English word "committed" inside `_leaders`' own docstring ("a vehicle
+committed to a turn"), not code, and not related to this change.
+
+Negative: sixteen lines of header now sit above the CSV in every
+sensor_log.csv, so any external tool that reads the file with a bare
+`csv.reader` or `pandas.read_csv()` without `comment='#'` will misparse
+the first sixteen rows as data. Nothing in this repository does that
+today (verified: `write_log` and the new tests are the only writers, and
+G8 is the only reader, both updated together), but this must be stated if
+sensor_log.csv is ever handed to a tool outside this repository.
+
+**Sources**
+
+This session's STEP 0 (write_log, encryption state, attack-button
+tracking, demand/density reachability, approval-record reachability, all
+confirmed by direct read before any code was written) and Reviewer G1-G10
+evidence, run against commit 0eb17ac. ADR-028 and ADR-029, whose
+reasoning about hash-binding and honest disclosure this entry extends
+rather than duplicates.
