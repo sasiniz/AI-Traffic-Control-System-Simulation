@@ -1,0 +1,17 @@
+# run_started_utc: 2026-08-19T12:57:29.682447+00:00
+# run_started_local: 2026-08-19T18:27:29.682447+05:30
+# run_ended_utc: 2026-08-19T12:57:29.712561+00:00
+# simulated_duration_s: 0.0
+# rows_written: 0
+# git_commit: 5c6d6d7
+# git_tree: dirty
+# schedule_file: E:\BSc Project Task\Simulation\signal_schedule_dated.csv
+# schedule_sha256: unavailable (no approval record - Simulation constructed directly, without the approval gate (e.g. a headless test or script))
+# approved_by: unavailable (no approval record - Simulation constructed directly, without the approval gate (e.g. a headless test or script))
+# approved_at: unavailable (no approval record - Simulation constructed directly, without the approval gate (e.g. a headless test or script))
+# encryption_at_end: on
+# encryption_toggled_during_run: no
+# attacks_fired: none
+# demand_multiplier: 1
+# density: 1x
+sim_time_s,clock,arm,demand_window,arrivals_window,blocked_entries,discharged_window,green_seconds_window,discharge_per_green_s,queue_length,mean_speed,accident_active,accident_location,anomaly_flag

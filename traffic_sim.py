@@ -651,6 +651,11 @@ ENABLE_LOGGING = True
 LOG_PATH = "sensor_log.csv"
 LOG_INTERVAL_S = 10.0
 
+# Per-run evidence copy, named from the run's own state so consecutive runs
+# never overwrite one another the way LOG_PATH above does. See
+# DECISIONS.md's run-file-naming ADR.
+RUNS_DIR = "results/runs"
+
 # The exact keys _maybe_log() (Section 13) puts in each log_rows dict, in
 # order - kept as a constant so write_log's zero-row branch can still write
 # a correct CSV column header when self.log_rows is empty and there is no
@@ -1629,20 +1634,71 @@ class Simulation:
         ]
         return [f"# {key}: {value}" for key, value in fields]
 
+    def _run_filename(self):
+        """Unique per-run filename, derived entirely from state this
+        program already tracks (attacks_fired, encryption_at_end,
+        demand_multiplier, run_started_utc) - never a bare timestamp alone,
+        so two runs under different conditions are distinguishable by name
+        without opening either file. See DECISIONS.md's run-file-naming ADR."""
+        ts = self.run_started_utc.strftime("%Y%m%dT%H%M%S")
+        attack_flag = "true" if self.attacks_fired else "false"
+        enc_flag = "on" if self.channel.encryption_enabled else "off"
+
+        density_label = None
+        for label, level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS):
+            if level == self.demand_multiplier:
+                density_label = label
+                break
+        dens_label = (
+            density_label if density_label is not None
+            else f"{self.demand_multiplier:g}x"
+        )
+
+        return (f"run_{ts}_attack-{attack_flag}_data_enc-{enc_flag}_"
+                f"dens-{dens_label}.csv")
+
     def write_log(self, path=LOG_PATH):
         """Always writes a file - even with zero rows, so a run that
         recorded nothing produces a file that says so rather than leaving
         a stale file from a previous run on disk. The provenance header
         (see _provenance_lines) is written above the CSV header, each line
         prefixed "# " so the file still parses as CSV via
-        pandas.read_csv(path, comment='#')."""
+        pandas.read_csv(path, comment='#').
+
+        Writes twice: once to `path` (LOG_PATH, "sensor_log.csv" by
+        default, unchanged - anything already reading that fixed name
+        keeps working), and, ONLY when `path` is the real default
+        (callers overriding `path` are tests exercising this function in
+        isolation, per security/test_security.py - they must not leave
+        files behind in the real repository), once more to a
+        uniquely-named copy under RUNS_DIR (see _run_filename) so
+        consecutive real runs under different conditions stop overwriting
+        each other and the operator stops having to rename by hand. Both
+        copies carry the identical provenance header and rows - one
+        open() of _provenance_lines() and one build of the CSV rows,
+        written twice, so the two files cannot describe two different
+        runs."""
         fields = SENSOR_LOG_FIELDS
-        with open(path, "w", newline="") as fh:
-            for line in self._provenance_lines():
+        provenance_lines = self._provenance_lines()
+
+        def _write_to(fh):
+            for line in provenance_lines:
                 fh.write(line + "\n")
             writer = csv.DictWriter(fh, fieldnames=fields)
             writer.writeheader()
             writer.writerows(self.log_rows)
+
+        with open(path, "w", newline="") as fh:
+            _write_to(fh)
+
+        if path != LOG_PATH:
+            return None
+
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        run_path = os.path.join(RUNS_DIR, self._run_filename())
+        with open(run_path, "w", newline="") as fh:
+            _write_to(fh)
+        return run_path
 
 
 # =============================================================================
