@@ -361,7 +361,7 @@ SIGNAL_TIMELINE_PATH = os.path.join(os.path.dirname(__file__),
 # (data/signal_schedule_plan_annual.csv, Phase B - not yet built) lands;
 # nothing else about the approval gate needs to change.
 APPROVAL_TARGET_PATH = os.path.join(os.path.dirname(__file__),
-                                    "signal_schedule_plan.csv")
+                                    "signal_schedule_dated.csv")
 
 # Read for display only (provenance text in the approval modal) - never
 # hashed, never part of what is approved. Missing or unreadable is
@@ -393,17 +393,24 @@ def _load_signal_timeline(path):
 
 
 def _parse_plan_rows(raw_bytes):
-    """Parses signal_schedule_plan.csv bytes (one row per hour/road) into
-    row dicts. The approval modal's SHA-256, its plan-summary line and its
-    review pane all derive from ONE read of these exact bytes (see
+    """Parses signal_schedule_dated.csv bytes (one row per datetime/road)
+    into row dicts. The approval modal's SHA-256, its plan-summary line and
+    its review pane all derive from ONE read of these exact bytes (see
     _run_approval_gate) - a second, independent open() of the same file
     could return different content (e.g. a regenerate mid-view) and
     silently make the hash and the table describe two different files.
-    See DECISIONS.md's review-pane ADR."""
+    See DECISIONS.md's review-pane and dated-schedule ADRs.
+
+    `datetime` is kept as the ISO 8601 string generate_dated_schedule.py
+    wrote (e.g. "2017-01-01T00:00:00") rather than parsed to a Timestamp -
+    ISO 8601 strings sort chronologically as plain strings, which is all
+    _pivot_plan_rows needs, and it keeps this function free of a pandas
+    dependency."""
     rows = []
     for row in csv.DictReader(io.StringIO(raw_bytes.decode("utf-8"))):
         rows.append({
-            "hour": int(row["hour"]),
+            "datetime": row["datetime"],
+            "hour_of_week": int(row["hour_of_week"]),
             "road": row["road"],
             "predicted_count": float(row["predicted_count"]),
             "green_seconds": int(row["green_seconds"]),
@@ -412,18 +419,21 @@ def _parse_plan_rows(raw_bytes):
 
 
 def _plan_summary_from_rows(rows):
-    """Row count and hour range from already-parsed plan rows - NOT
-    calendar dates: the plan file is an hour-of-week template (0-167, one
-    row per road per hour; see ADR-012's weekly regeneration horizon), not
-    a dated artefact - calendar dates only enter via SIGNAL_TIMELINE_PATH's
-    playback, a deliberately separate, deterministic expansion. Returns
-    None for an empty plan - the approval modal must show that plainly,
-    not crash on a missing or malformed plan.
+    """Row count and real datetime range from already-parsed plan rows.
+    Unlike the earlier hour-of-week template, this plan IS dated: every row
+    is a real historical timestamp from the model's held-out test period
+    (ADR-008), not a 0-167 template position - see DECISIONS.md's
+    dated-schedule ADR. Returns None for an empty plan - the approval modal
+    must show that plainly, not crash on a missing or malformed plan.
     """
     if not rows:
         return None
-    hours = [r["hour"] for r in rows]
-    return {"row_count": len(rows), "min_hour": min(hours), "max_hour": max(hours)}
+    datetimes = [r["datetime"] for r in rows]
+    return {
+        "row_count": len(rows),
+        "min_datetime": min(datetimes),
+        "max_datetime": max(datetimes),
+    }
 
 
 def _read_plan_summary(path):
@@ -442,18 +452,19 @@ def _read_plan_summary(path):
 
 
 def _pivot_plan_rows(rows, roads=ARMS):
-    """One row per hour, one column per road (green seconds) - the review
-    pane's PIVOTED view of the underlying one-row-per-(hour,road) plan.
-    Built from the same already-parsed `rows` the caller read once; never
-    re-reads or re-derives anything from disk itself. A road missing for
-    some hour renders as None rather than raising, so a malformed plan is
-    visible in the pane (a blank cell) instead of crashing the gate."""
-    by_hour = {}
+    """One row per datetime, one column per road (green seconds) - the
+    review pane's PIVOTED view of the underlying one-row-per-(datetime,road)
+    plan. Built from the same already-parsed `rows` the caller read once;
+    never re-reads or re-derives anything from disk itself. A road missing
+    for some datetime renders as None rather than raising, so a malformed
+    plan is visible in the pane (a blank cell) instead of crashing the
+    gate."""
+    by_dt = {}
     for r in rows:
-        by_hour.setdefault(r["hour"], {})[r["road"]] = r["green_seconds"]
+        by_dt.setdefault(r["datetime"], {})[r["road"]] = r["green_seconds"]
     return [
-        {"hour": hour, **{road: by_hour[hour].get(road) for road in roads}}
-        for hour in sorted(by_hour)
+        {"datetime": dt, **{road: by_dt[dt].get(road) for road in roads}}
+        for dt in sorted(by_dt)
     ]
 
 
@@ -2105,8 +2116,10 @@ class Renderer:
         self.text(f"File: {filename}", x, y, self.f_small, C_MUTED)
         y += 18
         if plan_summary:
-            period_txt = (f"Period: hour {plan_summary['min_hour']}-{plan_summary['max_hour']} "
-                          f"({plan_summary['row_count']} rows, hour-of-week template)")
+            period_txt = (f"Period: {plan_summary['min_datetime']} to "
+                          f"{plan_summary['max_datetime']} "
+                          f"({plan_summary['row_count']} rows, real historical "
+                          f"dates - ADR-008 held-out test period)")
         else:
             period_txt = "Period: UNREADABLE - plan file missing or malformed"
         self.text(period_txt, x, y, self.f_small, C_MUTED)
@@ -2118,21 +2131,25 @@ class Renderer:
         self.text(sha_txt, x, y, self.f_small, C_MUTED)
         y += 26
 
-        # -- review pane: PIVOTED (one row per hour) view of the SAME bytes
-        # sha256_hex was hashed over - see _parse_plan_rows/_pivot_plan_rows
-        # and DECISIONS.md's review-pane ADR. ---------------------------
-        pane_rect = None
+        # -- review pane: PIVOTED (one row per datetime) view of the SAME
+        # bytes sha256_hex was hashed over - see
+        # _parse_plan_rows/_pivot_plan_rows and DECISIONS.md's review-pane
+        # and dated-schedule ADRs. ------------------------------------
+        pane_rect = jump_end_rect = None
         total_rows = len(pivoted_rows)
         underlying = plan_summary["row_count"] if plan_summary else 0
         if total_rows:
             self.text(
-                f"PIVOTED VIEW - {total_rows} hour-of-week rows "
-                f"(from {underlying} underlying hour/road rows)",
+                f"PIVOTED VIEW - {total_rows} dated hourly rows "
+                f"(from {underlying} underlying datetime/road rows)",
                 x, y, self.f_small, C_MUTED)
             y += 18
 
-            hour_col_w = 70
-            road_col_w = (field_w - hour_col_w) // len(ARMS)
+            # Wide enough for a full ISO 8601 datetime ("2017-01-01T00:00:00",
+            # 19 characters) - unlike the old "HOUR" column, which only ever
+            # held a 1-3 digit number.
+            dt_col_w = 150
+            road_col_w = (field_w - dt_col_w) // len(ARMS)
             row_h = 16
             header_h = 18
             pane_h = header_h + APPROVAL_PANE_VISIBLE_ROWS * row_h
@@ -2140,8 +2157,8 @@ class Renderer:
             pygame.draw.rect(sc, C_CARD, pane_rect, border_radius=4)
             pygame.draw.rect(sc, C_MUTED, pane_rect, 1, border_radius=4)
 
-            self.text("HOUR", x + 8, y + 3, self.f_small, C_MUTED)
-            cx = x + hour_col_w
+            self.text("DATETIME", x + 8, y + 3, self.f_small, C_MUTED)
+            cx = x + dt_col_w
             for road in ARMS:
                 self.text(road, cx + 8, y + 3, self.f_small, C_MUTED)
                 cx += road_col_w
@@ -2149,8 +2166,8 @@ class Renderer:
 
             end = min(scroll_offset + APPROVAL_PANE_VISIBLE_ROWS, total_rows)
             for row in pivoted_rows[scroll_offset:end]:
-                self.text(str(row["hour"]), x + 8, row_y + 1, self.f_small, C_TEXT)
-                cx = x + hour_col_w
+                self.text(row["datetime"], x + 8, row_y + 1, self.f_small, C_TEXT)
+                cx = x + dt_col_w
                 for road in ARMS:
                     val = row.get(road)
                     self.text("-" if val is None else str(val), cx + 8, row_y + 1,
@@ -2159,16 +2176,31 @@ class Renderer:
                 row_y += row_h
             y += pane_h + 8
 
-            top_hour = pivoted_rows[scroll_offset]["hour"]
-            bottom_hour = pivoted_rows[end - 1]["hour"]
-            max_hour = pivoted_rows[-1]["hour"]
+            top_dt = pivoted_rows[scroll_offset]["datetime"]
+            bottom_dt = pivoted_rows[end - 1]["datetime"]
+            max_dt = pivoted_rows[-1]["datetime"]
             status_colour = C_GREEN if scrolled_to_end else C_MUTED
             status_txt = (
-                f"hour {top_hour}-{bottom_hour} of {max_hour}  "
+                f"{top_dt} to {bottom_dt} (of {max_dt})  "
                 f"(rows {scroll_offset + 1}-{end} of {total_rows})"
-                + ("  - reached end, ACCEPT enabled" if scrolled_to_end else "")
+                + ("  - end reached" if scrolled_to_end else "")
             )
             self.text(status_txt, x, y, self.f_small, status_colour)
+
+            # Visible "jump to end" affordance (ADR-033: at this row count,
+            # 300+ PAGEDOWNs is not a review, it's an endurance test) -
+            # clickable, and mirrors the END key exactly (both call the
+            # same _scroll_to(max_scroll) in _run_approval_gate). Hidden
+            # once the gate is already satisfied - jumping to the end is
+            # meaningless at that point, and the status line above grows a
+            # suffix here that would otherwise collide with this button
+            # (found by screenshot review, not by inspection - see
+            # DECISIONS.md's dated-schedule ADR).
+            if not scrolled_to_end:
+                jump_end_rect = pygame.Rect(x + field_w - 150, y - 3, 150, 22)
+                pygame.draw.rect(sc, C_BLUE, jump_end_rect, 1, border_radius=4)
+                self.text("END: jump to last row", jump_end_rect.centerx,
+                          jump_end_rect.centery, self.f_small, C_BLUE, centre=True)
             y += 20
         else:
             self.text("PIVOTED VIEW - plan file unreadable, nothing to review",
@@ -2212,8 +2244,8 @@ class Renderer:
                 pygame.draw.rect(sc, C_MUTED, accept_rect, 1, border_radius=5)
                 self.text("ACCEPT", accept_rect.centerx, accept_rect.centery,
                           self.f_med, C_MUTED, centre=True)
-                self.text("scroll to the last row to enable", x + 150,
-                          accept_rect.centery, self.f_small, C_MUTED)
+                self.text("scroll to the last row to enable (or press END)",
+                          x + 150, accept_rect.centery, self.f_small, C_MUTED)
             y += 48
 
             if error_message:
@@ -2224,13 +2256,13 @@ class Renderer:
                 y += 18
 
         self.text(
-            "TAB switch field · UP/DOWN/PGUP/PGDN/wheel scroll · ENTER submit · ESC quit",
+            "TAB field · UP/DOWN/PGUP/PGDN/HOME/END/wheel scroll · ENTER submit · ESC quit",
             box.centerx, box.bottom - 20, self.f_small, C_MUTED, centre=True)
 
         # Returned so _run_approval_gate's mouse hit-testing and scroll
         # status use the exact rects just rendered, not a second hardcoded
         # copy that can drift - same reasoning as SEC_BUTTONS (Section 1).
-        return u_rect, p_rect, accept_rect, pane_rect
+        return u_rect, p_rect, accept_rect, pane_rect, jump_end_rect
 
 
 # =============================================================================
@@ -2280,7 +2312,7 @@ def _run_approval_gate(clock, renderer):
     active_field = "username"
     attempt_count = 0
     error_message = None
-    u_rect = p_rect = accept_rect = pane_rect = None
+    u_rect = p_rect = accept_rect = pane_rect = jump_end_rect = None
 
     scroll_offset = 0
     max_scroll = max(0, len(pivoted_rows) - APPROVAL_PANE_VISIBLE_ROWS)
@@ -2351,6 +2383,14 @@ def _run_approval_gate(clock, renderer):
                     _scroll_to(scroll_offset - APPROVAL_PANE_VISIBLE_ROWS)
                 elif event.key == pygame.K_PAGEDOWN:
                     _scroll_to(scroll_offset + APPROVAL_PANE_VISIBLE_ROWS)
+                elif event.key == pygame.K_HOME:
+                    _scroll_to(0)
+                elif event.key == pygame.K_END:
+                    # One keypress to the last row - see DECISIONS.md's
+                    # dated-schedule ADR on why this exists: at thousands
+                    # of pivoted rows, PAGEDOWN alone would take hundreds
+                    # of presses to reach the end.
+                    _scroll_to(max_scroll)
                 elif event.key == pygame.K_RETURN:
                     record = _attempt_submit()
                     if record is not None:
@@ -2366,12 +2406,14 @@ def _run_approval_gate(clock, renderer):
                     active_field = "username"
                 elif p_rect and p_rect.collidepoint(event.pos):
                     active_field = "password"
+                elif jump_end_rect and jump_end_rect.collidepoint(event.pos):
+                    _scroll_to(max_scroll)
                 elif accept_rect and accept_rect.collidepoint(event.pos):
                     record = _attempt_submit()
                     if record is not None:
                         return record
 
-        u_rect, p_rect, accept_rect, pane_rect = renderer.draw_approval_modal(
+        u_rect, p_rect, accept_rect, pane_rect, jump_end_rect = renderer.draw_approval_modal(
             plan_summary=plan_summary, provenance=provenance, sha256_hex=sha256_hex,
             fields=fields, active_field=active_field, attempt_count=attempt_count,
             error_message=error_message, operators_missing=operators_missing,

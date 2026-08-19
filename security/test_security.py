@@ -462,9 +462,10 @@ def test_approval_load_latest_returns_none_for_unknown_path():
 
 def test_pivot_plan_rows_preserves_row_count_and_first_last_rows():
     """Pure-function check (no pygame): _pivot_plan_rows must not lose or
-    reorder data relative to the underlying (hour, road) rows it pivots -
-    same row count relationship (168 hours = 672 / 4 roads) and the same
-    first/last hour's green_seconds, road for road."""
+    reorder data relative to the underlying (datetime, road) rows it
+    pivots - same row count relationship (4344 hours = 17376 / 4 roads,
+    the ADR-008 test period 2017-01-01 to 2017-06-30) and the same
+    first/last datetime's green_seconds, road for road."""
     import traffic_sim
 
     with open(traffic_sim.APPROVAL_TARGET_PATH, "rb") as fh:
@@ -472,19 +473,20 @@ def test_pivot_plan_rows_preserves_row_count_and_first_last_rows():
     rows = traffic_sim._parse_plan_rows(raw)
     pivoted = traffic_sim._pivot_plan_rows(rows)
 
-    assert len(rows) == 672
-    assert len(pivoted) == 168
+    assert len(rows) == 17376
+    assert len(pivoted) == 4344
     assert len(pivoted) * len(traffic_sim.ARMS) == len(rows)
 
-    first_hour_rows = {r["road"]: r["green_seconds"] for r in rows if r["hour"] == 0}
-    last_hour = max(r["hour"] for r in rows)
-    last_hour_rows = {r["road"]: r["green_seconds"] for r in rows if r["hour"] == last_hour}
+    first_dt = min(r["datetime"] for r in rows)
+    last_dt = max(r["datetime"] for r in rows)
+    first_dt_rows = {r["road"]: r["green_seconds"] for r in rows if r["datetime"] == first_dt}
+    last_dt_rows = {r["road"]: r["green_seconds"] for r in rows if r["datetime"] == last_dt}
 
-    assert pivoted[0]["hour"] == 0
-    assert pivoted[-1]["hour"] == last_hour
+    assert pivoted[0]["datetime"] == first_dt == "2017-01-01T00:00:00"
+    assert pivoted[-1]["datetime"] == last_dt == "2017-06-30T23:00:00"
     for road in traffic_sim.ARMS:
-        assert pivoted[0][road] == first_hour_rows[road]
-        assert pivoted[-1][road] == last_hour_rows[road]
+        assert pivoted[0][road] == first_dt_rows[road]
+        assert pivoted[-1][road] == last_dt_rows[road]
 
 
 def _setup_gate_test(username, password):
@@ -518,7 +520,7 @@ def _setup_gate_test(username, password):
     # state, so a throwaway draw call finds the exact rects the real gate
     # will draw - this is what tells the test (and a real operator) where
     # to click.
-    u_rect, p_rect, accept_rect, _pane_rect = renderer.draw_approval_modal(
+    u_rect, p_rect, accept_rect, _pane_rect, jump_end_rect = renderer.draw_approval_modal(
         plan_summary=traffic_sim._plan_summary_from_rows(rows),
         provenance=traffic_sim._read_model_provenance(traffic_sim.MODEL_CARD_PATH),
         sha256_hex=sha256_file(traffic_sim.APPROVAL_TARGET_PATH),
@@ -527,7 +529,7 @@ def _setup_gate_test(username, password):
         pivoted_rows=pivoted_rows, scroll_offset=0, scrolled_to_end=False,
     )
     assert accept_rect is not None, "no ACCEPT rect drawn - operators_missing branch taken?"
-    return renderer, clock, u_rect, p_rect, accept_rect
+    return renderer, clock, u_rect, p_rect, accept_rect, jump_end_rect
 
 
 def test_approval_gate_mouse_click_on_accept_submits():
@@ -551,18 +553,18 @@ def test_approval_gate_mouse_click_on_accept_submits():
     log_backup = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else None
 
     try:
-        renderer, clock, _u, _p, accept_rect = _setup_gate_test(username, password)
+        renderer, clock, _u, _p, accept_rect, _jump = _setup_gate_test(username, password)
 
         for ch in username:
             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
         pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB, unicode="", mod=0))
         for ch in password:
             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
-        # 168 rows, 14 visible, PAGEDOWN moves 14 rows - 12 presses (168)
-        # clamps past the last page regardless of the exact remainder.
-        for _ in range(12):
-            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_PAGEDOWN,
-                                                   unicode="", mod=0))
+        # 4344 pivoted rows at this window size - END jumps to the last
+        # page in one keypress (see DECISIONS.md's dated-schedule ADR;
+        # PAGEDOWN alone would take hundreds of presses here).
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_END,
+                                               unicode="", mod=0))
 
         result = {}
 
@@ -617,7 +619,7 @@ def test_approval_gate_accept_refused_before_scrolled_to_end():
     log_backup = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else None
 
     try:
-        renderer, clock, _u, _p, accept_rect = _setup_gate_test(username, password)
+        renderer, clock, _u, _p, accept_rect, _jump = _setup_gate_test(username, password)
         before = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else b""
 
         for ch in username:
@@ -652,16 +654,75 @@ def test_approval_gate_accept_refused_before_scrolled_to_end():
         after = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else b""
         assert before == after, "a refused submit attempt appended to approvals.jsonl"
 
-        # 3. Now scroll to the end and accept - must succeed.
-        for _ in range(12):
-            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_PAGEDOWN,
-                                                   unicode="", mod=0))
+        # 3. Now jump to the end (END key) and accept - must succeed.
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_END,
+                                               unicode="", mod=0))
         time.sleep(0.2)
         pygame.event.post(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, button=1, pos=accept_rect.center))
         gate_thread.join(timeout=5.0)
 
         assert not gate_thread.is_alive(), "gate did not return after scrolling to the end and clicking ACCEPT"
+        record = result.get("record")
+        assert record is not None
+        assert record.username == username
+    finally:
+        if creds_backup is None:
+            DEFAULT_CREDENTIALS_PATH.unlink(missing_ok=True)
+        else:
+            DEFAULT_CREDENTIALS_PATH.write_bytes(creds_backup)
+        if log_backup is None:
+            DEFAULT_APPROVAL_LOG_PATH.unlink(missing_ok=True)
+        else:
+            DEFAULT_APPROVAL_LOG_PATH.write_bytes(log_backup)
+
+
+def test_approval_gate_home_after_end_keeps_scroll_ratchet():
+    """ADR-033's scroll ratchet: pressing HOME after END must move the view
+    back to the top WITHOUT re-disabling ACCEPT - the gate only ever needs
+    the end reached once, not reached-and-currently-displayed. This is the
+    behaviour that makes it safe for an operator to jump to the end, then
+    HOME back to double check row 0, without being forced to scroll to the
+    end a second time."""
+    import threading
+    import time
+
+    import pygame
+
+    import traffic_sim
+    from security.auth import DEFAULT_CREDENTIALS_PATH, OperatorAuth
+    from security.approval import DEFAULT_APPROVAL_LOG_PATH
+
+    username, password = "audit_home_operator", "HomeAfterEnd!2026"
+
+    creds_backup = DEFAULT_CREDENTIALS_PATH.read_bytes() if DEFAULT_CREDENTIALS_PATH.exists() else None
+    log_backup = DEFAULT_APPROVAL_LOG_PATH.read_bytes() if DEFAULT_APPROVAL_LOG_PATH.exists() else None
+
+    try:
+        renderer, clock, _u, _p, accept_rect, _jump = _setup_gate_test(username, password)
+
+        for ch in username:
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB, unicode="", mod=0))
+        for ch in password:
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_END, unicode="", mod=0))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_HOME, unicode="", mod=0))
+
+        result = {}
+
+        def _run():
+            result["record"] = traffic_sim._run_approval_gate(clock, renderer)
+
+        gate_thread = threading.Thread(target=_run, daemon=True)
+        gate_thread.start()
+        time.sleep(0.3)
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, button=1, pos=accept_rect.center))
+        gate_thread.join(timeout=5.0)
+
+        assert not gate_thread.is_alive(), \
+            "ACCEPT was refused after END then HOME - the scroll ratchet did not hold"
         record = result.get("record")
         assert record is not None
         assert record.username == username
@@ -788,6 +849,7 @@ ALL_TESTS = [
     test_pivot_plan_rows_preserves_row_count_and_first_last_rows,
     test_approval_gate_mouse_click_on_accept_submits,
     test_approval_gate_accept_refused_before_scrolled_to_end,
+    test_approval_gate_home_after_end_keeps_scroll_ratchet,
     test_write_log_round_trips_via_pandas_comment_parsing,
     test_write_log_zero_rows_replaces_decoy_file,
 ]
