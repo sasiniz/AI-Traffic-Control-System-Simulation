@@ -2176,3 +2176,322 @@ json moved aside: no crash, the modal names the setup command, restored
 after), C7 (37/37 tests; Simulation() construction confirmed not to
 touch operators.json), C8 (grep, as above). ADR-005 and ADR-023, quoted
 directly where cited above.
+
+## ADR-029: Encryption at rest for sensor_log.csv not implemented, superseding that part of ADR-023
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Supersedes:** the at-rest half of ADR-023's Decision. ADR-023 otherwise
+stands: in-transit AES-256-GCM, bcrypt operator authentication, the
+in-process channel, and the two-attack scope are unchanged.
+
+**Context**
+
+ADR-023's Decision section states: "AES-256-GCM (AEAD) protects a periodic
+per-arm sensor reading in transit and sensor_log.csv at rest." The first
+half of that sentence is true and demonstrable. The second half was never
+true of the running system.
+
+A read-only audit on 2026-08-19 against the tree at commit abe3811 traced
+the log write path and found:
+
+  - Simulation._maybe_log (traffic_sim.py:1342-1363) appends plain dict
+    rows to self.log_rows.
+  - Simulation.write_log (traffic_sim.py:1457-1464) writes those rows with
+    csv.DictWriter directly. There is no crypto call anywhere in that path.
+  - crypto.py provides encrypt_log_line and decrypt_log_line
+    (crypto.py:144-155). A grep for both names across every .py file in the
+    repository returns call sites only in security/test_security.py:61,63.
+    There are zero call sites in traffic_sim.py.
+  - The first two lines of sensor_log.csv on disk are a plaintext CSV header
+    followed by a plaintext data row beginning
+    10.0,08:00,North,0,0,0,0,10.01.
+
+The primitive is correct and tested. test_log_line_round_trip_at_rest passes
+as part of the 38-test suite. It is simply not connected to anything.
+
+The gap survived a week and a full Review C pass because every test written
+for the at-rest path tested the function, and no test asserted anything
+about the bytes that actually reach disk. A unit test on a primitive says
+nothing about whether the primitive is called.
+
+**Decision**
+
+Do not implement encryption at rest before submission. Record here that
+sensor_log.csv is written as plaintext, that ADR-023's claim to the contrary
+was incorrect, and that crypto.py's at-rest functions exist and pass their
+unit tests but have no production call site.
+
+Every submitted document, and every section of the dissertation, describes
+encryption in this project as protecting sensor readings in transit only.
+No document may claim at-rest protection.
+
+The residual risk is stated rather than mitigated. sensor_log.csv contains
+simulated vehicle counts and timestamps from a Pygame junction. It holds no
+personal data, no credentials, and no real infrastructure telemetry. It is
+gitignored and never leaves the development machine. The exposure created by
+leaving it plaintext is therefore local disk read access to synthetic data.
+This is a real gap against ISO/IEC 27001:2022 A.5.33 and A.8.24, and a small
+one in consequence.
+
+**Alternatives rejected**
+
+Wiring encrypt_log_line into write_log. This is roughly twenty lines and the
+primitive already works, so the implementation cost is not the objection.
+The objection is the read side: every consumer of sensor_log.csv would need
+a decrypt path, and an encrypted evidence file that cannot be opened and
+read during a viva is worse for demonstrating the project than a plaintext
+one. With four days remaining and the dissertation unwritten, the schedule
+cost of the change plus its regression surface is not justified by the risk
+it removes on synthetic data. Recorded as future work.
+
+Silently amending ADR-023 to delete the at-rest clause. Rejected outright.
+DECISIONS.md is append-only. An examiner reading a corrected history learns
+nothing; an examiner reading a superseding entry learns that the project
+audited itself and found its own false claim.
+
+Leaving ADR-023 unamended and simply not mentioning at-rest encryption in
+the dissertation. Rejected: the contradiction would still sit in a committed
+artefact submitted as evidence, and would be found by anyone who read the
+decision log alongside the repository.
+
+**Consequences**
+
+Positive: the decision log now matches the code. The in-transit claim, which
+is the one the attack demonstrations actually depend on, is unaffected and
+remains demonstrable by keypress. The discovery method is itself reportable:
+a decision was recorded, believed, and left unimplemented for a week, and
+was caught only by a read-only audit that grepped for call sites rather than
+for definitions. That is a finding about the limits of ADR discipline and it
+belongs in the Evaluation chapter, not buried here.
+
+Negative: the project demonstrates one of two standard cryptographic
+postures rather than both. Data at rest is unprotected. State this as a
+limitation in Evaluation and as future work in the Conclusion, in those
+words, before anyone else does.
+
+Process consequence: unit-testing a cryptographic primitive is not evidence
+that data is protected. Any future claim of the form "X protects Y" requires
+a test that inspects Y, not a test that exercises X. The audit item that
+caught this (A4) worked because it read the bytes on disk.
+
+**Sources**
+
+Read-only audit A4, run 2026-08-19 against commit abe3811, tree clean.
+Evidence: write-path trace, grep for encrypt_log_line/decrypt_log_line call
+sites across all .py files, and the first two lines of the on-disk file.
+ISO/IEC 27001:2022 Annex A, A.5.33 Protection of records and A.8.24 Use of
+cryptography.
+
+## ADR-030: Single project title fixed across all submitted documents
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+**Context**
+
+Three documents carried three different project titles.
+
+  - Computing Project Proposal Form, signed 17/05/2026: "Secure AI Driven
+    Smart Traffic Control System with Integrated Cybersecurity and
+    Governance."
+  - Research Ethics Application, signed 29/04/2026: "Intelli Flow AI: Secure
+    and Adaptive Smart Traffic Control System".
+  - Working title used in CLAUDE.md and the repository README: a third
+    variant.
+
+Beyond the inconsistency, the ethics form title contains the word "Adaptive",
+which is architecturally false for this system. ADR-005 fixes the invariant:
+the signal timeline is compiled offline and the simulation plays it back
+without making scheduling decisions. SignalController holds no reference to
+queues, sensors, accidents or anomalies, verified by scoped grep in audit
+item A5. A title claiming adaptivity contradicts the project's central claim
+in its first line.
+
+All three deliverables are submitted together on 23 August 2026, so the
+proposal and ethics form are resubmitted rather than fixed historically.
+Correcting them is possible and required.
+
+**Decision**
+
+The title is, in all documents, the repository README, CLAUDE.md, the
+dissertation title page, and any presentation:
+
+  Secure AI Driven Smart Traffic Control System with Integrated
+  Cybersecurity and Governance
+
+**Alternatives rejected**
+
+"Intelli Flow AI: Secure and Adaptive Smart Traffic Control System".
+Rejected on two grounds. "Adaptive" contradicts ADR-005 and the pre-planned
+invariant. "Intelli Flow AI" is a product name for a system that is a
+simulation and a dissertation artefact, not a product, and it displaces the
+word "Governance", which names a third of the project's actual contribution.
+
+Retaining "Adaptive" and redefining it in the text to mean "the schedule
+adapts between weekly regenerations". Rejected: a title should not need a
+definition to stop being misleading, and the reading a marker brings to the
+word is the reading that counts.
+
+**Consequences**
+
+Positive: one title across every artefact. The word most likely to invite
+the question "so does it react to live traffic or not?" is removed from the
+first line an examiner reads, which means the pre-planned architecture is
+presented as a deliberate design position rather than as a defence.
+
+Negative: the resubmitted ethics form will differ in title from the version
+signed on 29/04/2026. This must be mentioned to the supervisor rather than
+changed quietly, alongside the other scope corrections being made to that
+form.
+
+**Sources**
+
+Computing Project Proposal Form, S.M. Sasiru N. Senadhiparhi, signed
+17/05/2026. Wrexham University Research Ethics Application for Partner
+Institutions, Appendix 2, signed 29/04/2026. ADR-005. Audit item A5,
+2026-08-19.
+
+## ADR-031: Approval modal review pane - scroll-gated ACCEPT, pivoted from one read
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+**Context**
+
+ADR-028 built the approval gate: a human operator authenticates and a hash
+binds their decision to the exact bytes of signal_schedule_plan.csv. It did
+not put the plan itself in front of the operator. Before this change, an
+operator could authenticate and click ACCEPT having seen only a filename,
+an hour range, a row count and sixteen hex characters of a hash - never a
+single green-seconds value the schedule would actually deliver. A signature
+bound to unseen bytes is a hash check with a human's name attached to it,
+not a review.
+
+The plan file is one row per (hour, road): 672 rows, 168 hours * 4 roads
+(confirmed directly against the file at STEP 0 of this task: header
+`hour,road,predicted_count,green_seconds`, 673 lines including header).
+Rendering all 672 rows in that shape would mean reading the same four-road
+group of numbers under four different row labels for every hour scrolled
+past. A pivoted view - one row per hour, one column per road - shows the
+same information in 168 rows instead of 672, and each row is the actual
+unit an operator would reason about ("hour 19: North 49s, South 23s, East
+20s, West 16s"), not a slice of it.
+
+**Decision**
+
+The approval modal gained a scrollable review pane, above the credential
+fields, showing the pivoted view (`_pivot_plan_rows`, traffic_sim.py) 14
+rows at a time, with UP/DOWN/PAGEUP/PAGEDOWN/mouse-wheel scrolling and a
+"hour X-Y of 167 (rows A-B of 168)" position indicator.
+
+ACCEPT is drawn visibly disabled (grey, with a "scroll to the last row to
+enable" hint) until a `scrolled_to_end` flag is set, which happens once
+`scroll_offset` has reached the last page - a ratchet, not reset by
+scrolling back up, so an operator who scrolls once and then re-checks an
+earlier row without incident does not have to scroll to the end a second
+time. `_attempt_submit()`, the single closure ADR-028 already required
+ENTER and a mouse click on ACCEPT to share, gained one more early-exit
+check: `if not scrolled_to_end: return None`. Both submit paths therefore
+inherit the gate for free; there is no second place to add or forget it.
+
+The plan file is read exactly once per gate invocation, as raw bytes.
+`hashlib.sha256` runs over those bytes; `_parse_plan_rows` and
+`_pivot_plan_rows` parse the SAME bytes for the summary line and the
+table. `_run_approval_gate` no longer calls `sha256_file()` or the old
+path-based `_read_plan_summary()` (which each opened the file
+independently) - both are collapsed into one `open(...).read()`. A second,
+independent read could observe a different file if something rewrote
+`signal_schedule_plan.csv` between the two opens (a regenerate mid-review,
+a concurrent write); at that point the hash and the table would each be
+honest about a different file, and the operator would be approving neither
+one correctly. `_read_plan_summary(path)` is kept, unchanged in contract,
+for callers that do not need to share a read with a hash (currently only
+the test suite's throwaway rect-geometry lookups).
+
+**Why an operator who cannot read the artefact is not meaningfully
+approving it:** ADR-028 already established that binding a decision to an
+unread file's hash approves nothing in particular if the file could differ
+from what was intended. The same reasoning applies one level up: a hash
+faithfully bound to a file the operator never looked at is still a
+decision made blind. Sign-off is supposed to be evidence a human judged the
+schedule reasonable for the roads and hours it covers - underpowering
+West at 3am, say, or over-favouring North all week - and that judgement is
+only possible if the numbers were in front of them. The scroll gate does
+not verify judgement occurred; it verifies the minimum precondition
+without which judgement cannot occur.
+
+**Why the scroll gate exists, specifically as a gate rather than a
+suggestion:** an ACCEPT button that is merely present next to an
+unscrolled table is, in practice, indistinguishable from ADR-028's
+original modal - nothing stops an operator opening the app, typing
+credentials, and clicking ACCEPT within the first second, exactly as
+before this change. Disabling the control until the last row has been
+displayed is the only mechanism available in this UI (no click-tracking
+per row, no eye-tracking, no reading-time heuristic) that forces at least
+the display of every row into the sequence of events leading to approval.
+
+**Alternatives rejected**
+
+Showing a summary (min/max/mean green seconds per road, or a chart) instead
+of full rows. Rejected: a summary is a second, independently-computed
+artefact, not the artefact being hashed - it reintroduces exactly the
+two-reads-can-diverge risk this change eliminates for the raw rows, this
+time between "what was approved" (the file) and "what was shown"
+(statistics about the file). A summary can also smooth over the single bad
+hour a scroll would surface; the approval is supposed to be of the actual
+schedule, not of its shape in aggregate.
+
+Allowing ACCEPT without scrolling, with scrolling merely offered as
+optional. Rejected on the reasoning above: an optional review pane changes
+nothing about what an operator can get away with, and the entire point of
+this feature is to make "I approved it without looking" structurally
+harder than "I approved it after looking", not merely possible either way.
+
+A one-shot "I have reviewed this schedule" checkbox instead of scroll
+tracking. Rejected: a checkbox can be ticked in the same second the modal
+opens, which is exactly the failure mode ADR-028 already has and this
+change exists to close. Scroll position is not self-report; it is the one
+piece of state in this UI that cannot be true unless the rows were
+actually paged through.
+
+**Consequences**
+
+Positive: the hash, the summary line and the table now derive from one
+`open()` call, closing a double-read that existed in the pre-change code
+(`_read_plan_summary(APPROVAL_TARGET_PATH)` and `sha256_file
+(APPROVAL_TARGET_PATH)` were two independent opens). Verified this session
+(E3): `hashlib.sha256` over the bytes `_parse_plan_rows`/`_pivot_plan_rows`
+consumed equals `sha256_file(path)`'s independent result, and the pivoted
+row count times four roads equals the underlying row count exactly
+(168 * 4 = 672). Verified (E4): the pivoted view's first and last rows
+agree field-for-field with the file's hour-0 and hour-167 rows. Verified
+(E1/E2, both the mouse and keyboard submit paths): ACCEPT and ENTER are
+both refused with `approvals.jsonl` byte-identical before/after when
+attempted before scrolling to the end, and both succeed, with a record
+correctly appended, once scrolled to the last row.
+
+Negative, and the honest limit of this control: **scrolling past every row
+evidences that the rows were displayed on screen, not that they were read
+or understood.** An operator can page down at speed without registering a
+single value, exactly as a person can click through a EULA without reading
+it. This control raises the minimum physical interaction required before
+ACCEPT is reachable; it cannot, and does not claim to, verify comprehension
+or judgement. This limitation must be stated plainly in the dissertation
+wherever this feature is described as a governance control, in the same
+terms used here, not overstated as "the operator reviewed the schedule".
+
+Negative: the modal grew from 560x460 to 760x660 to fit the pane without
+clipping (verified by screenshot at three scroll states: top, mid-scroll,
+and bottom-with-ACCEPT-enabled - box.y and box.bottom leave a 30px margin
+to the 1280x720 window at both the top and bottom in the worst-case text
+layout, error message and attempt count both present). A future change to
+`APPROVAL_PANE_VISIBLE_ROWS` (currently 14) must re-check this margin
+rather than assume it still fits.
+
+**Sources**
+
+This session's STEP 0 (header and row-count confirmation against
+signal_schedule_plan.csv) and Review E1-E4, E6, E7 evidence. ADR-028,
+whose `_attempt_submit()` single-submit-path design this change extends
+rather than duplicates.
