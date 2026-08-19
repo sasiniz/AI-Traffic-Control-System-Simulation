@@ -357,11 +357,14 @@ SIGNAL_TIMELINE_PATH = os.path.join(os.path.dirname(__file__),
 # compile_timeline() expands the plan into the phase-by-phase timeline
 # deterministically; approving the expansion would be approving a
 # derived artefact, not the authored one - see DECISIONS.md's approval
-# ADR. THIS IS THE ONE LINE TO CHANGE when the annual plan
-# (data/signal_schedule_plan_annual.csv, Phase B - not yet built) lands;
-# nothing else about the approval gate needs to change.
+# ADR. Points at the recursive annual forecast (see DECISIONS.md's
+# recursive-forecast ADR, which discloses the 2.51x week26/week1 MAE
+# degradation this artefact carries) rather than the dated schedule -
+# see DECISIONS.md's approval-repointing ADR for why, and for the note
+# that _parse_plan_rows below also had to change (schema difference,
+# annual rows have no hour_of_week column) for this to actually work.
 APPROVAL_TARGET_PATH = os.path.join(os.path.dirname(__file__),
-                                    "signal_schedule_dated.csv")
+                                    "signal_schedule_annual.csv")
 
 # Read for display only (provenance text in the approval modal) - never
 # hashed, never part of what is approved. Missing or unreadable is
@@ -393,24 +396,37 @@ def _load_signal_timeline(path):
 
 
 def _parse_plan_rows(raw_bytes):
-    """Parses signal_schedule_dated.csv bytes (one row per datetime/road)
-    into row dicts. The approval modal's SHA-256, its plan-summary line and
-    its review pane all derive from ONE read of these exact bytes (see
+    """Parses APPROVAL_TARGET_PATH bytes (one row per datetime/road) into
+    row dicts. The approval modal's SHA-256, its plan-summary line and its
+    review pane all derive from ONE read of these exact bytes (see
     _run_approval_gate) - a second, independent open() of the same file
     could return different content (e.g. a regenerate mid-view) and
     silently make the hash and the table describe two different files.
-    See DECISIONS.md's review-pane and dated-schedule ADRs.
+    See DECISIONS.md's review-pane, dated-schedule and
+    approval-repointing ADRs.
 
-    `datetime` is kept as the ISO 8601 string generate_dated_schedule.py
-    wrote (e.g. "2017-01-01T00:00:00") rather than parsed to a Timestamp -
-    ISO 8601 strings sort chronologically as plain strings, which is all
+    `datetime` is kept as the ISO 8601 string the generator wrote (e.g.
+    "2017-01-01T00:00:00") rather than parsed to a Timestamp - ISO 8601
+    strings sort chronologically as plain strings, which is all
     _pivot_plan_rows needs, and it keeps this function free of a pandas
-    dependency."""
+    dependency.
+
+    `hour_of_week` is read with .get(), not row["hour_of_week"]:
+    generate_dated_schedule.py's CSV has that column,
+    generate_annual_forecast.py's does not (it has `lags_real` instead,
+    which this function does not need - nothing downstream of this parse
+    uses hour_of_week either, it is carried through for the dated
+    schedule's own sake only). A hard row["hour_of_week"] lookup would
+    KeyError on every row of the annual file, which _run_approval_gate
+    catches and silently turns into an EMPTY plan - no crash, but also no
+    review pane and a scroll gate that is trivially already "at the end"
+    with nothing in it. See DECISIONS.md's approval-repointing ADR."""
     rows = []
     for row in csv.DictReader(io.StringIO(raw_bytes.decode("utf-8"))):
+        hour_of_week = row.get("hour_of_week")
         rows.append({
             "datetime": row["datetime"],
-            "hour_of_week": int(row["hour_of_week"]),
+            "hour_of_week": int(hour_of_week) if hour_of_week is not None else None,
             "road": row["road"],
             "predicted_count": float(row["predicted_count"]),
             "green_seconds": int(row["green_seconds"]),
@@ -2174,8 +2190,9 @@ class Renderer:
         if plan_summary:
             period_txt = (f"Period: {plan_summary['min_datetime']} to "
                           f"{plan_summary['max_datetime']} "
-                          f"({plan_summary['row_count']} rows, real historical "
-                          f"dates - ADR-008 held-out test period)")
+                          f"({plan_summary['row_count']} rows, recursive "
+                          f"forecast - see DECISIONS.md's recursive-forecast "
+                          f"and approval-repointing ADRs)")
         else:
             period_txt = "Period: UNREADABLE - plan file missing or malformed"
         self.text(period_txt, x, y, self.f_small, C_MUTED)

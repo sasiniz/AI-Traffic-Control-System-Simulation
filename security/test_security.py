@@ -463,9 +463,10 @@ def test_approval_load_latest_returns_none_for_unknown_path():
 def test_pivot_plan_rows_preserves_row_count_and_first_last_rows():
     """Pure-function check (no pygame): _pivot_plan_rows must not lose or
     reorder data relative to the underlying (datetime, road) rows it
-    pivots - same row count relationship (4344 hours = 17376 / 4 roads,
-    the ADR-008 test period 2017-01-01 to 2017-06-30) and the same
-    first/last datetime's green_seconds, road for road."""
+    pivots - same row count relationship (8760 hours = 35040 / 4 roads,
+    the recursive annual forecast window 2017-07-01 to 2018-06-30 - see
+    DECISIONS.md's approval-repointing ADR) and the same first/last
+    datetime's green_seconds, road for road."""
     import traffic_sim
 
     with open(traffic_sim.APPROVAL_TARGET_PATH, "rb") as fh:
@@ -473,8 +474,8 @@ def test_pivot_plan_rows_preserves_row_count_and_first_last_rows():
     rows = traffic_sim._parse_plan_rows(raw)
     pivoted = traffic_sim._pivot_plan_rows(rows)
 
-    assert len(rows) == 17376
-    assert len(pivoted) == 4344
+    assert len(rows) == 35040
+    assert len(pivoted) == 8760
     assert len(pivoted) * len(traffic_sim.ARMS) == len(rows)
 
     first_dt = min(r["datetime"] for r in rows)
@@ -482,8 +483,8 @@ def test_pivot_plan_rows_preserves_row_count_and_first_last_rows():
     first_dt_rows = {r["road"]: r["green_seconds"] for r in rows if r["datetime"] == first_dt}
     last_dt_rows = {r["road"]: r["green_seconds"] for r in rows if r["datetime"] == last_dt}
 
-    assert pivoted[0]["datetime"] == first_dt == "2017-01-01T00:00:00"
-    assert pivoted[-1]["datetime"] == last_dt == "2017-06-30T23:00:00"
+    assert pivoted[0]["datetime"] == first_dt == "2017-07-01T00:00:00"
+    assert pivoted[-1]["datetime"] == last_dt == "2018-06-30T23:00:00"
     for road in traffic_sim.ARMS:
         assert pivoted[0][road] == first_dt_rows[road]
         assert pivoted[-1][road] == last_dt_rows[road]
@@ -560,9 +561,10 @@ def test_approval_gate_mouse_click_on_accept_submits():
         pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB, unicode="", mod=0))
         for ch in password:
             pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=0, unicode=ch, mod=0))
-        # 4344 pivoted rows at this window size - END jumps to the last
-        # page in one keypress (see DECISIONS.md's dated-schedule ADR;
-        # PAGEDOWN alone would take hundreds of presses here).
+        # 8760 pivoted rows at this window size - END jumps to the last
+        # page in one keypress (see DECISIONS.md's dated-schedule and
+        # approval-repointing ADRs; PAGEDOWN alone would take hundreds of
+        # presses here).
         pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_END,
                                                unicode="", mod=0))
 
