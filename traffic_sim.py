@@ -58,6 +58,7 @@ import json
 import math
 import os
 import random
+import subprocess
 from datetime import datetime, timezone
 
 import pygame
@@ -475,6 +476,35 @@ def _read_model_provenance(path):
             f"target={target_mode}, trained before {split_date}")
 
 
+def _git_provenance():
+    """(git_commit, git_tree) for write_log's provenance header - each
+    either a real value or "unavailable (reason)". Never raises: a
+    missing git binary or a non-repo checkout must not crash a run that
+    is otherwise finished and just trying to write its log."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _run(args):
+        try:
+            result = subprocess.run(
+                args, cwd=repo_dir, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"unavailable ({type(exc).__name__}: {exc})"
+        if result.returncode != 0:
+            return None, f"unavailable (exit {result.returncode}: {result.stderr.strip()})"
+        return result.stdout.strip(), None
+
+    commit, commit_err = _run(["git", "rev-parse", "--short", "HEAD"])
+    git_commit = commit if commit_err is None else commit_err
+
+    status, status_err = _run(["git", "status", "--porcelain"])
+    if status_err is not None:
+        git_tree = status_err
+    else:
+        git_tree = "dirty" if status else "clean"
+
+    return git_commit, git_tree
+
+
 # Arrivals per hour per arm, by hour of day. Real demand: mean Vehicles per
 # (Road, hour-of-day) across the full data/traffic_final_cleaned.csv, rounded
 # to the nearest vehicle. Verified independently against the dataset before
@@ -609,6 +639,17 @@ ANOMALY_RATE_MIN = 0.15          # vehicles discharged per second OF GREEN
 ENABLE_LOGGING = True
 LOG_PATH = "sensor_log.csv"
 LOG_INTERVAL_S = 10.0
+
+# The exact keys _maybe_log() (Section 13) puts in each log_rows dict, in
+# order - kept as a constant so write_log's zero-row branch can still write
+# a correct CSV column header when self.log_rows is empty and there is no
+# row to read fieldnames from.
+SENSOR_LOG_FIELDS = [
+    "sim_time_s", "clock", "arm", "demand_window", "arrivals_window",
+    "blocked_entries", "discharged_window", "green_seconds_window",
+    "discharge_per_green_s", "queue_length", "mean_speed",
+    "accident_active", "accident_location", "anomaly_flag",
+]
 
 CHANNEL_LOG_CAP = 20             # entries kept for the dashboard's channel log
 
@@ -1146,6 +1187,20 @@ class Simulation:
         self.log_rows = []
         self._next_log = LOG_INTERVAL_S
 
+        # Real wall-clock run start, for write_log's provenance header
+        # (Section 13) only - nothing in the simulation itself reads this.
+        self.run_started_utc = datetime.now(timezone.utc)
+        # Set True the first time the E key / ENCRYPT button fires (see
+        # main()'s sec_actions "encryption" entry) - distinct from
+        # self.channel.encryption_enabled, which only ever shows the
+        # CURRENT state and cannot tell a reader whether it changed
+        # mid-run.
+        self.encryption_toggled = False
+        # Names of attacks fired this run (see main()'s _make_false_data_attack
+        # / _make_spoof_attack) - a record, unlike sim.channel's interceptor
+        # list, which the H key / CLEAR button empties.
+        self.attacks_fired = set()
+
         # Security channel: encrypts/authenticates the periodic sensor
         # reading sent to the dashboard operator (see _maybe_log below). It
         # is a second, parallel "what does the operator see" path, built on
@@ -1195,6 +1250,11 @@ class Simulation:
         self.approved_by = None
         self.approved_at = None
         self.approval_sha256_prefix = None
+        # Full SHA-256, distinct from the prefix above (which is display-only,
+        # truncated for the dashboard). write_log's provenance header needs
+        # the full hash so schedule_sha256 there can be compared byte-for-byte
+        # against security/approvals.jsonl.
+        self.approval_sha256 = None
 
     # -- clock --------------------------------------------------------------
     @property
@@ -1502,11 +1562,73 @@ class Simulation:
             )
         self.classification = results
 
+    def _provenance_lines(self):
+        """The header block write_log() writes above the CSV, one field per
+        line. Every value is either real or the literal string
+        "unavailable (reason)" - never blank, never "None" - so a missing
+        field is visible as missing rather than silently absent. This is
+        self-reported by the same program that wrote the data below it and
+        is NOT tamper-evident (see DECISIONS.md's provenance-header ADR);
+        it exists so an unlabelled sensor_log.csv is never mistaken for
+        labelled evidence, not to replace the hash-bound approval record.
+        """
+        run_ended_utc = datetime.now(timezone.utc)
+        git_commit, git_tree = _git_provenance()
+
+        def _or_unavailable(value, reason):
+            return value if value is not None else f"unavailable ({reason})"
+
+        no_approval_reason = (
+            "no approval record - Simulation constructed directly, "
+            "without the approval gate (e.g. a headless test or script)"
+        )
+
+        density_label = None
+        for label, level in zip(DENSITY_BUTTON_LABELS, DEMAND_LEVELS):
+            if level == self.demand_multiplier:
+                density_label = label
+                break
+        density_txt = (
+            density_label if density_label is not None
+            else f"unavailable (demand_multiplier={self.demand_multiplier!r} "
+                 f"matches no DEMAND_LEVELS entry)"
+        )
+
+        attacks_txt = (
+            ", ".join(sorted(self.attacks_fired)) if self.attacks_fired else "none"
+        )
+
+        fields = [
+            ("run_started_utc", self.run_started_utc.isoformat()),
+            ("run_started_local", self.run_started_utc.astimezone().isoformat()),
+            ("run_ended_utc", run_ended_utc.isoformat()),
+            ("simulated_duration_s", f"{self.sim_time:.1f}"),
+            ("rows_written", str(len(self.log_rows))),
+            ("git_commit", git_commit),
+            ("git_tree", git_tree),
+            ("schedule_file", APPROVAL_TARGET_PATH),
+            ("schedule_sha256", _or_unavailable(self.approval_sha256, no_approval_reason)),
+            ("approved_by", _or_unavailable(self.approved_by, no_approval_reason)),
+            ("approved_at", _or_unavailable(self.approved_at, no_approval_reason)),
+            ("encryption_at_end", "on" if self.channel.encryption_enabled else "off"),
+            ("encryption_toggled_during_run", "yes" if self.encryption_toggled else "no"),
+            ("attacks_fired", attacks_txt),
+            ("demand_multiplier", f"{self.demand_multiplier:g}"),
+            ("density", density_txt),
+        ]
+        return [f"# {key}: {value}" for key, value in fields]
+
     def write_log(self, path=LOG_PATH):
-        if not self.log_rows:
-            return
-        fields = list(self.log_rows[0].keys())
+        """Always writes a file - even with zero rows, so a run that
+        recorded nothing produces a file that says so rather than leaving
+        a stale file from a previous run on disk. The provenance header
+        (see _provenance_lines) is written above the CSV header, each line
+        prefixed "# " so the file still parses as CSV via
+        pandas.read_csv(path, comment='#')."""
+        fields = SENSOR_LOG_FIELDS
         with open(path, "w", newline="") as fh:
+            for line in self._provenance_lines():
+                fh.write(line + "\n")
             writer = csv.DictWriter(fh, fieldnames=fields)
             writer.writeheader()
             writer.writerows(self.log_rows)
@@ -2285,6 +2407,7 @@ def main():
     sim.approved_by = approval.username
     sim.approved_at = approval.timestamp
     sim.approval_sha256_prefix = approval.sha256[:16]
+    sim.approval_sha256 = approval.sha256
 
     # Shared by the E/F/G/H/S/K key handlers and the SEC_BUTTONS mouse
     # handler below, so keyboard and mouse trigger the exact same action -
@@ -2293,12 +2416,17 @@ def main():
     # at PRESS time, so toggling STEALTH or KEY COMP changes what the next
     # press builds without altering any attack already in interceptors.
     def _make_false_data_attack():
+        # Recorded regardless of mode/key-compromise - write_log's
+        # provenance header (Section 13) only needs to know an attack of
+        # this kind fired this run, not which variant.
+        sim.attacks_fired.add("false_data_injection")
         return FalseDataInjectionAttack(
             mode="stealthy" if sim.attack_stealthy else "crude",
             crypto=sim.channel.crypto if sim.attack_key_compromise else None,
         )
 
     def _make_spoof_attack():
+        sim.attacks_fired.add("sensor_spoofing")
         return SensorSpoofingAttack(
             crypto=sim.channel.crypto if sim.attack_key_compromise else None,
         )
@@ -2332,9 +2460,12 @@ def main():
             speed = level
         return _setter
 
+    def _toggle_encryption():
+        sim.channel.encryption_enabled = not sim.channel.encryption_enabled
+        sim.encryption_toggled = True
+
     sec_actions = {
-        "encryption": lambda: setattr(sim.channel, "encryption_enabled",
-                                       not sim.channel.encryption_enabled),
+        "encryption": _toggle_encryption,
         "false_data": lambda: sim.channel.add_interceptor(_make_false_data_attack()),
         "spoof": lambda: sim.channel.add_interceptor(_make_spoof_attack()),
         "clear_attacks": lambda: sim.channel.clear_interceptors(),

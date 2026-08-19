@@ -676,6 +676,77 @@ def test_approval_gate_accept_refused_before_scrolled_to_end():
             DEFAULT_APPROVAL_LOG_PATH.write_bytes(log_backup)
 
 
+# ---------------------------------------------------------------------------
+# traffic_sim.py -- write_log's provenance header (ADR-032)
+# ---------------------------------------------------------------------------
+
+def test_write_log_round_trips_via_pandas_comment_parsing():
+    """write_log's provenance header lines are prefixed '# ' specifically so
+    the file still parses as CSV via pandas.read_csv(comment='#') - this
+    test is the thing that actually checks that claim, not just the
+    function that writes it."""
+    import pandas as pd
+    import traffic_sim
+
+    sim = traffic_sim.Simulation()
+    sim.sim_time = 25.3
+    sim.log_rows = [
+        {
+            "sim_time_s": 10.0, "clock": "08:00", "arm": "North",
+            "demand_window": 2, "arrivals_window": 2, "blocked_entries": 0,
+            "discharged_window": 1, "green_seconds_window": 10.01,
+            "discharge_per_green_s": 0.0999, "queue_length": 0,
+            "mean_speed": 2.2, "accident_active": 0, "accident_location": "",
+            "anomaly_flag": 0,
+        },
+        {
+            "sim_time_s": 20.0, "clock": "08:00", "arm": "South",
+            "demand_window": 1, "arrivals_window": 1, "blocked_entries": 0,
+            "discharged_window": 0, "green_seconds_window": 5.0,
+            "discharge_per_green_s": 0.0, "queue_length": 1,
+            "mean_speed": 0.0, "accident_active": 0, "accident_location": "",
+            "anomaly_flag": 0,
+        },
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sensor_log.csv"
+        sim.write_log(path=str(path))
+
+        df = pd.read_csv(path, comment="#")
+        assert len(df) == len(sim.log_rows) == 2
+        assert list(df.iloc[0][["sim_time_s", "arm", "discharged_window"]]) == [10.0, "North", 1]
+        assert list(df.iloc[-1][["sim_time_s", "arm", "queue_length"]]) == [20.0, "South", 1]
+
+        header_lines = [l for l in path.read_text().splitlines() if l.startswith("#")]
+        assert any(l.startswith("# rows_written: 2") for l in header_lines)
+        assert not any(": None" in l or l.rstrip() == "#" for l in header_lines), \
+            "a blank or 'None' provenance field slipped through"
+
+
+def test_write_log_zero_rows_replaces_decoy_file():
+    """A run that recorded zero rows must still replace whatever file was
+    there before it - never leave a stale prior run's data looking current."""
+    import traffic_sim
+
+    decoy = "DECOY - this line must not survive a zero-row write_log() call\n"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sensor_log.csv"
+        path.write_text(decoy)
+        assert path.read_text() == decoy
+
+        sim = traffic_sim.Simulation()
+        assert sim.log_rows == []
+        sim.write_log(path=str(path))
+
+        contents = path.read_text()
+        assert decoy not in contents, "zero-row write_log left the decoy file untouched"
+        assert any(l.startswith("# rows_written: 0") for l in contents.splitlines())
+        assert "sim_time_s,clock,arm" in contents, \
+            "zero-row write must still write the CSV column header"
+
+
 ALL_TESTS = [
     test_crypto_round_trip,
     test_crypto_rejects_tampered_ciphertext,
@@ -717,6 +788,8 @@ ALL_TESTS = [
     test_pivot_plan_rows_preserves_row_count_and_first_last_rows,
     test_approval_gate_mouse_click_on_accept_submits,
     test_approval_gate_accept_refused_before_scrolled_to_end,
+    test_write_log_round_trips_via_pandas_comment_parsing,
+    test_write_log_zero_rows_replaces_decoy_file,
 ]
 
 
