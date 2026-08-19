@@ -3164,3 +3164,126 @@ rule applied to K11), ADR-020 (`model_card.json`'s recorded single-step
 test MAEs, referenced for the deployment-vs-presentation comparison),
 ADR-021 (the allocation constants quoted and reused unchanged), ADR-033
 (the dated-schedule decision this entry amends but does not reverse).
+
+---
+
+## ADR-035: Run evidence filenames derived from run state, not a timestamp alone
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+**Context**
+
+`write_log()` always wrote to the fixed name `LOG_PATH`
+("sensor_log.csv"). Every run overwrote the previous run's file, so
+comparing two runs (for example, an attack run against a clean baseline,
+or one density level against another) required the operator to rename
+the file by hand between runs, with no enforcement that they actually
+did so before starting the next one. A silently overwritten prior run is
+lost evidence, not a cosmetic inconvenience, in a project whose
+governance chapter depends on runs being individually inspectable.
+
+A bare timestamp would fix the overwrite problem but not the inspection
+problem: a reader facing a directory of `run_20260819T125729.csv`,
+`run_20260819T125730.csv`, ... still has to open every file to find the
+one attack run among a folder of clean baselines.
+
+**Decision**
+
+Each real run additionally writes an identical copy of `sensor_log.csv`
+to `results/runs/`, named by concatenating four pieces of state the
+program already tracks on `Simulation`: `attacks_fired` (as a single
+true/false flag, not the attack list itself - the list is already in
+the provenance header, see below), `channel.encryption_enabled` (on/off),
+`demand_multiplier` (mapped back to its `DENSITY_BUTTON_LABELS` label
+where one matches, else the raw multiplier), and `run_started_utc`
+(`%Y%m%dT%H%M%S`) - e.g.
+`run_20260819T125730_attack-true_data_enc-on_dens-10x.csv`. All four
+values are read directly from `Simulation` state that already exists for
+other reasons (the provenance header, the attack buttons, the density
+buttons); none is computed freshly for this filename, so the filename
+cannot drift from what the provenance header inside the same file says -
+verified this session (L2): all three condition fields in each of three
+test filenames matched that file's own header exactly.
+
+`write_log()` still writes the fixed `sensor_log.csv` name first, byte
+identical to before this change (same `_provenance_lines()` call, same
+row data, written to both destinations from one function so they cannot
+describe two different runs) - anything already reading that fixed name
+keeps working, per this task's explicit constraint.
+
+The second write is gated on `path == LOG_PATH`, i.e. it fires only for
+the real default-path call site (`sim.write_log()` at the bottom of
+`main()`). `security/test_security.py`'s two `write_log` tests both call
+`sim.write_log(path=str(tmp_path))` specifically so their fabricated,
+throwaway `log_rows` never touch the real repository; without this
+guard, every `pytest` run would silently deposit a synthetic file into
+`results/runs/` alongside real evidence, indistinguishable from it by
+name. Verified this session: 43/43 suite passes, and `results/runs/`
+contains exactly the 3 files this session's manual L1 verification run
+created, none from the test run that followed it.
+
+`results/runs/` is not added to `.gitignore` - these files are run
+evidence for the governance chapter, the same reasoning `sensor_log.csv`
+itself would have if ADR-029 had not separately decided against
+committing it. Confirmed this session: `git check-ignore` returns
+non-matching (exit 1) for files under `results/runs/`, and `git status`
+lists the directory as untracked rather than ignored.
+
+**Alternatives rejected**
+
+A bare timestamp filename. Rejected in Context, above: it solves the
+overwrite problem but re-creates the original inspection problem one
+level down - a human still has to open every file to find the one they
+want.
+
+Letting the operator name the file (a prompt or CLI argument at run
+start). Rejected: this project's signal-generation and schedule
+artefacts are already deterministic and scripted wherever possible
+(ADR-021's allocation formula, `generate_timeline.py`'s expansion) -
+adding a manual, unenforced naming step here would be the one place a
+human could get run evidence wrong or skip naming it at all. Derivation
+from state the program already tracks removes that failure mode
+entirely: a run's name is a fact about the run, not a choice made about
+it. This filename derivation is deterministic scripting, exactly like
+`allocate_green()`'s rounding - it is not part of the model's or the
+allocation layer's contribution and should not be read as one; stated
+here plainly so a reader of `results/runs/`'s filenames does not
+mistake a naming convention for an AI-driven decision.
+
+Encoding the full attack list (rather than a true/false flag) in the
+filename. Rejected: `attacks_fired` can contain multiple entries
+(verified this session: one test run fired both
+`false_data_injection` and `sensor_spoofing`), and an unbounded field in
+a filename risks OS path-length limits and awkward sorting. The full
+list is already in the provenance header inside the file
+(`attacks_fired` field) - the filename only needs to distinguish "an
+attack happened" from "a clean baseline" for a reader scanning the
+directory, not to duplicate the header's detail.
+
+**Consequences**
+
+Positive: comparing runs no longer requires the operator to have
+remembered to rename anything. Verified this session (L1): three
+consecutive runs under three different condition combinations (clean
+baseline; one attack, encryption on, 10x density; two attacks,
+encryption off, 50x density) produced three distinct files, none
+overwriting another.
+
+Negative: `results/runs/` now accumulates one file per real run
+indefinitely - nothing in this change prunes old runs. Acceptable at
+current scale (this is evidence, not a cache), but a future session
+generating many runs (for example, an automated attack-simulation sweep
+at Stage 8) should revisit whether accumulation needs bounding, because
+this entry does not address it.
+
+Negative: the `path == LOG_PATH` guard means a caller who legitimately
+wants a real run's evidence copy AND a custom sensor_log.csv path
+(neither test call site today does this, but nothing prevents a future
+one from wanting it) gets only the custom-path write, silently, unless
+that future caller reads this entry first.
+
+**Sources**
+
+None, design decision. L1-L5 evidence produced this session against the
+real `write_log()` and the real `results/runs/` directory.
