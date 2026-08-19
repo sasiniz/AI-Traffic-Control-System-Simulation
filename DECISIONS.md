@@ -2661,3 +2661,214 @@ confirmed by direct read before any code was written) and Reviewer G1-G10
 evidence, run against commit 0eb17ac. ADR-028 and ADR-029, whose
 reasoning about hash-binding and honest disclosure this entry extends
 rather than duplicates.
+
+## ADR-033: Dated schedule generated over held-out historical data, not forecast forward - amends ADR-012's horizon
+
+**Date:** 2026-08-19
+**Status:** Accepted
+**Amends:** ADR-012's weekly regeneration horizon. Does not reverse it -
+ADR-012's reasoning (lag_168/lag_336/roll_168_lag168 cannot be computed
+past 168 hours ahead, so a schedule cannot be forecast further forward
+than that without recursive forecasting or fabrication) is unaffected and
+still governs any FORWARD schedule. This entry adds a second, different
+kind of schedule - one generated over dates that have already happened -
+which sidesteps that constraint entirely rather than solving it.
+
+**Context**
+
+The brief that produced this entry asked for an annual, dated schedule
+covering 2017-07-01 to 2018-06-30, generated forward from the existing
+trained model without retraining, fabricating, or imputing any data.
+STEP 0 checked this against the data before writing any code, as
+instructed, and found it impossible as specified:
+data/traffic_final_cleaned.csv ends at 2017-06-30 23:00 (confirmed
+directly: `df['DateTime'].max()`); the requested window starts exactly
+one hour later and runs a full year past it. Every one of the requested
+35,040 rows would need a feature value with no real row behind it
+anywhere in the source data. This is not a partial gap to work around -
+it is the entire window. Per the task's own instruction ("If any of a-e
+fails, stop and report rather than working around it"), this stopped
+before any code was written, and the finding was reported rather than
+silently substituted.
+
+Offered a choice between using the model's real 6-month held-out test
+window instead (2017-01-01 to 2017-06-30, 17,376 rows), stopping
+entirely, or something else, the operator chose the real test window.
+This is also the honest answer to a question implicit in the original
+"annual" framing: no full 12-month window in this dataset is
+simultaneously real (non-synthetic) data AND held out from training -
+the real test split per ADR-008 is six months, not twelve, because the
+dataset itself only spans 2015-11-01 to 2017-06-30.
+
+**Decision**
+
+`generate_dated_schedule.py` (new file, independent of
+`generate_timeline.py`, which is unmodified) builds a DATED schedule -
+`signal_schedule_dated.csv`, one row per (real datetime, road), 17,376
+rows - over 2017-01-01 00:00 to 2017-06-30 23:00: every hour in
+`model_card.json`'s own `test_row_count: 17376`, i.e. every row the
+model's `split_date: "2017-01-01"` already marks as held out from
+training. `models/count_model.joblib` is loaded and only ever `.predict()`-ed,
+never `.fit()`-ed. Every feature value is read via `data_prep.load_and_engineer()`
+from real rows already present in `traffic_final_cleaned.csv` - the
+target window sits inside the dataset, not past its end, so no future
+row ever needs to be fabricated or appended (contrast
+`generate_timeline.py`'s `build_plan_from_model()`, which DOES append
+future rows with `Vehicles=NaN`, because ADR-012's weekly window is
+genuinely in the future relative to generation time). Counts are
+converted to green seconds by the SAME, unmodified `allocate_green()`
+(ADR-021: `CYCLE_SECONDS=120`, `AMBER_SECONDS=3`, `MIN_GREEN_SECONDS=12`,
+`AVAILABLE_GREEN=108`, largest-remainder rounding) - confirmed this
+session (J3/J4): every hour's four `green_seconds` values sum to exactly
+108, and the observed minimum across all 17,376 rows is 14s, above the
+12s floor.
+
+**What generating over held-out historical data does, and does not,
+demonstrate:** this is NOT a forecast. Every predicted count in
+`signal_schedule_dated.csv` is the model's output for an hour that has
+already happened, using lag features computed from real prior hours that
+have also already happened - nothing here required the model to predict
+into a future no data exists for. What it DOES demonstrate: the model,
+frozen exactly as trained (no retraining, no leakage, `split_date`
+respected), applied at genuine scale (17,376 rows, six months, not a
+three-hour demo plan) to data it never saw during training, running
+through the unmodified ADR-021 allocation layer end to end, and now
+sitting behind the same hash-bound, scroll-gated approval control
+(ADR-028, ADR-031) as any other schedule this project produces. What it
+does NOT demonstrate: that the model can forecast a real future week or
+year. That question is ADR-012's, and remains open exactly as ADR-012
+left it - dropping the illegal features costs accuracy so badly
+(calendar-only MAE 15.10 against 4.25) that no annual horizon is honestly
+deployable from this feature set, a finding this entry does not disturb.
+
+**The J5 baseline result:** measured this session, model `predicted_count`
+against a `lag_8760` seasonal naive baseline (same hour, exactly one
+year - 8760 hours - earlier; fully computable here since one year before
+the earliest window hour, 2016-01-01, sits inside the dataset with zero
+missing lookups). Per road: East 5.70 vs 8.68, North 9.72 vs 33.82, South
+4.65 vs 10.80, West 2.06 vs 3.09 (model MAE listed first in each pair).
+OVERALL_excl_West (ADR-011 convention): model 6.69 vs naive 17.77 - the
+model wins clearly, by a wide margin, on every individual road as well as
+overall. This is reported as measured, per the task's own instruction to
+report a naive win plainly if that had been the result; here the finding
+runs the other way, by more than the margin ADR-020's rolling-vs-static
+comparison needed to call meaningful. (These per-road MODEL figures are
+not a new measurement - they reproduce `model_card.json`'s pre-recorded
+"static" protocol test MAEs exactly, which is itself a cross-check that
+this generation path computes what the model card already claims it
+does.)
+
+**The weakened scroll gate, stated as a real consequence, not
+minimised:** ADR-031's gate required scrolling to literally the last of
+168 pivoted rows - about 12 PAGEDOWNs, a small enough number that
+reaching it was a reasonable proxy for "the rows were at least paged
+past". At 4,344 pivoted rows, the same PAGEDOWN-only mechanism would take
+over 300 presses - not a review, an endurance test nobody would actually
+perform, which would make the gate a control that exists on paper and is
+routinely defeated by the operator disabling their own patience. HOME,
+END and a visible "END: jump to last row" button (returned from
+`draw_approval_modal` as `jump_end_rect`, hit-tested exactly like
+`accept_rect`/`u_rect`/`p_rect`) now make reaching the end a single
+keypress or click. This is an explicit, honest weakening of the gate from
+"was shown every row" (true at 168 rows, where paging through all of them
+was a low enough cost that an operator plausibly would) to "was shown the
+artefact and confirmed its extent" (true at any row count, but a strictly
+weaker claim) - not a fix, a trade against scale. ADR-031's own stated
+limitation - scrolling evidences display, not comprehension - already
+applied even at 168 rows; this entry does not make that limitation worse
+in kind, only easier to reach without the comprehension ADR-031 was
+already honest about not being able to verify.
+
+**The weekly template stays on disk:** `signal_schedule_plan.csv` (673
+lines, the ADR-012 hour-of-week template `generate_timeline.py`
+produces) is untouched by this change - not deleted, not regenerated, not
+read by anything this entry adds. Confirmed this session: absent from
+`git status`, present on disk at its prior line count, `git log` shows no
+commit touching it after this work began. `APPROVAL_TARGET_PATH` now
+points at `signal_schedule_dated.csv` instead, so the weekly template is
+no longer what gets approved or played - but it exists, unmodified, for
+`generate_timeline.py` to keep producing independently whenever that
+separate, still-live code path is run.
+
+**Alternatives rejected**
+
+Recursive multi-step forecasting: predict week 1 of the requested annual
+window, feed those predictions back in as the lag features for week 2,
+and iterate for 52 weeks. This was already rejected once, in ADR-012, for
+the general annual-horizon problem, and is rejected again here for the
+same reason: error compounds across iterations with nothing in this
+project's scope to bound it, and STEP 0 already showed the requested
+window doesn't need this technique to be honestly built at all once
+corrected to real dates - reaching for a compounding-error technique to
+avoid stopping and reporting a data gap would have been solving the wrong
+problem.
+
+Synthesising, imputing, or otherwise fabricating feature values for the
+missing 2017-07-01-to-2018-06-30 window so the ORIGINAL annual brief
+could be satisfied literally. Rejected outright, and was the explicit
+reason STEP 0 stopped rather than working around the gap: this project's
+West-road history (ADR-002) already carries one disclosed synthetic
+segment and the cost of disclosing it honestly across a dozen later ADRs;
+manufacturing a second one to make an annual demo file exist would be the
+exact failure this project's own audit culture (ADR-025 through ADR-029)
+exists to catch, self-inflicted.
+
+Keeping the ORIGINAL annual window and simply degrading the claim (e.g.
+labelling it "illustrative, not evidential"). Rejected: a file with
+35,040 rows of fabricated-by-necessity numbers, sitting behind the same
+hash-bound approval control used for genuine schedules, invites exactly
+the confusion a disclaimer buried in an ADR would not prevent - the
+control's whole design (ADR-028, ADR-031) is that what gets approved
+looks and behaves like what gets played. A schedule that cannot honestly
+carry that weight should not be built merely because it was asked for
+before the data gap was known.
+
+**Consequences**
+
+Positive: `signal_schedule_dated.csv` and the review pane that displays
+it are traceable end to end to real rows in
+`data/traffic_final_cleaned.csv`, verified this session (J1, J2): exactly
+17,376 rows, first datetime 2017-01-01T00:00:00, last
+2017-06-30T23:00:00, zero rows in the source window carrying
+`Synthetic_Segment_Unverified=True`. Full suite: 43/43 (was 42 - two
+tests updated for the new `datetime`/`hour_of_week` schema and the END
+key, two added: HOME-after-END ratchet persistence, and the earlier
+pivot/row-count check re-targeted at the new file). Scoped grep (J10):
+zero hits for `annual`, `datetime`, `schedule`, `predict` on executable
+lines inside `Vehicle.update` or `Simulation._leaders`; one hit inside
+`SignalController` - `current_datetime_label`, a pre-existing,
+unmodified, display-only getter for the dashboard (SECTION 15) that
+returns already-loaded timeline metadata and touches nothing this entry
+added - not a violation of the reactivity invariant, and flagged here
+rather than quietly excluded from the count.
+
+Negative: this is a second schedule-generation code path
+(`generate_dated_schedule.py`) alongside `generate_timeline.py`, and they
+will drift unless deliberately kept in sync - they already share
+`allocate_green()`, `ROTATION`, `MODEL_PATH` and `CYCLE_SECONDS` by
+import rather than duplication, but the row-building logic itself (dated
+vs hour-of-week) is necessarily separate, and a future change to one
+that should apply to both (e.g. a change to how `hour_of_week` or the
+plan's date semantics work) must be made in both files or checked
+against both.
+
+Negative, disclosed rather than smoothed over: the approval modal's
+scroll gate is measurably weaker at this scale than ADR-031 described it
+- see above. Any dissertation text describing the scroll gate as a
+governance control must state the row-count-dependent difference between
+"scrolled past every row" (168-row weekly template) and "confirmed the
+artefact's extent via a jump control" (4,344-row dated schedule), not
+present both as the same strength of control.
+
+**Sources**
+
+This session's STEP 0 (date-range and coverage check against
+`traffic_final_cleaned.csv`, run before any code was written, which is
+what surfaced the annual window's infeasibility) and Reviewer J1-J10
+evidence, run against the real generated `signal_schedule_dated.csv`.
+`model_card.json`'s `split_date`/`test_row_count` fields, cross-checked
+against this session's own computation. ADR-008 (the temporal split this
+window reuses), ADR-011 (the OVERALL_excl_West convention applied to
+J5), ADR-012 (the horizon reasoning this entry amends), ADR-021 (the
+allocation constants quoted and reused unchanged), ADR-028/ADR-031 (the
+approval gate and review pane this schedule now flows through).
