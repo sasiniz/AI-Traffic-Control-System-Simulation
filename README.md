@@ -202,9 +202,11 @@ The simulation is intentionally driven by a handful of editable constants at
 the top of `traffic_sim.py`, rather than command-line flags or a config file:
 
 - **`DRIVE_SIDE`** — `"right"` or `"left"`. Flips every lane and turn
-  geometry consistently. Currently set to `"right"`; the Sri Lankan context
-  this project is motivated by drives on the left, so this is left as an
-  explicit, unresolved choice for the author rather than a silent default.
+  geometry consistently. Set to `"right"`. The Sri Lankan junction that
+  motivates this project drives on the left, so the rendered layout does not
+  match it; ADR-039 records why the default was kept and confirms that no
+  reported result depends on the value. Nothing in the timing pipeline reads
+  it.
 - **`MOVEMENT_SPLIT`** — per-arm straight/left/right percentages for spawned
   traffic, e.g. `North: {"straight": 55, "left": 25, "right": 20}`.
 - **`HOURLY_DEMAND`** — hour-of-day → arrivals per arm, the mean of the real
@@ -279,6 +281,10 @@ a row that is itself present in the sample.
   simulated sensor share the same Python process and trust boundary; this
   demonstrates the cryptographic properties correctly but is not a claim
   the system has been tested against a network-positioned adversary.
+- The junction renders right-hand drive while the motivating Sri Lankan
+  junction drives on the left. No reported result depends on this — the
+  prediction, allocation, compilation and playback stages never read
+  `DRIVE_SIDE` — see ADR-039.
 
 ## Roadmap
 

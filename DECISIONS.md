@@ -3812,3 +3812,72 @@ commit `f02383a`, 2026-08-18, predating ADR-029); direct read of
 unpropagated), ADR-012/034 (the horizon this entry corrected in
 `README.md`), ADR-013/015/020 (the Stage 1/2 completion this entry
 corrected in `CLAUDE.md`).
+
+## ADR-039: Simulation renders right-hand drive; DRIVE_SIDE left at its default
+
+**Date:** 2026-08-20
+**Status:** Accepted
+
+**Context**
+
+`traffic_sim.py:173` sets `DRIVE_SIDE = "right"`. The constant flips lane
+assignment and turn geometry consistently across the whole junction, so
+`"left"` is a supported value and not a stub.
+
+The project is motivated by Kesbewa junction in Sri Lanka, where traffic
+drives on the left. The simulation therefore renders the opposite convention
+to the real junction it cites, which was verified by inspection: on the
+south arm the northbound approach queue forms east of the centreline, and on
+the east arm westbound traffic runs north of the centreline. Both are
+right-hand-drive placements.
+
+Nothing in the signal timing pipeline depends on this value. The Random
+Forest predicts vehicle counts per road and hour, `allocate_green()`
+converts counts to green seconds under ADR-021's constraints,
+`compile_timeline()` expands the plan, and `SignalController` plays the
+result back. None of those four stages reads `DRIVE_SIDE`, and no figure
+reported anywhere in `results/` would change if it were flipped. The
+security layer, the two attacks, the five detection signals and the approval
+gate are equally independent of it.
+
+**Decision**
+
+Leave `DRIVE_SIDE = "right"`. Record here, and state in the dissertation's
+limitations, that the rendered driving side does not match the motivating
+junction's, that the constant exists and supports `"left"`, and that no
+reported result depends on it.
+
+**Alternatives rejected**
+
+Setting `DRIVE_SIDE = "left"` to match Sri Lanka. This is the more faithful
+option and would have been correct earlier in the project. Rejected on
+timing: it is a geometry change three days before submission, after the
+evaluation runs in `results/runs/` were captured and while the
+implementation chapter's screenshots are still to be taken. A rendering
+regression at this point would cost time that no result depends on
+recovering. Recorded as future work.
+
+Describing the setting as a deliberate simplification. Rejected as
+inaccurate. Nothing was simplified away; the default was never changed, and
+claiming otherwise would misrepresent a straightforward omission as a design
+choice.
+
+Leaving it undocumented. Rejected. The mismatch is visible in every
+screenshot in the implementation chapter and will be noticed by anyone who
+reads the motivation first.
+
+**Consequences**
+
+Positive: the geometry, the evaluation runs and any screenshots already
+captured all stay consistent, and the separation between presentation and
+timing is now recorded rather than assumed.
+
+Negative: figures of the junction do not depict Sri Lankan road layout.
+Anyone reading the motivation and then the implementation chapter will see
+the mismatch, so the limitations section must name it before they do.
+
+**Sources**
+
+`traffic_sim.py:173`. Visual verification of lane placement on the south and
+east arms, 2026-08-20. ADR-005 and ADR-021 for the timing pipeline's
+independence from rendering.
