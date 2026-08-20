@@ -3,7 +3,10 @@ crypto.py -- AES-256-GCM encryption and authentication for sensor readings.
 
 Job of this file (see security/README.md for the ISO 27001 control mapping):
     Confidentiality AND integrity of data in transit between a simulated
-    sensor and the dashboard, and confidentiality of sensor_log.csv at rest.
+    sensor and the dashboard. NOT at rest: sensor_log.csv is written as
+    plaintext. The encrypt_log_line/decrypt_log_line helpers below exist
+    and pass their unit tests, but have zero call sites outside
+    test_security.py - see ADR-029.
 
 Design note (ADR-023, see DECISIONS.md):
     AES-256-GCM is an AEAD cipher: encryption and authentication happen in
@@ -139,12 +142,13 @@ class SensorCrypto:
     def decrypt_json(self, message: EncryptedMessage, associated_data: Optional[bytes] = None) -> dict:
         return json.loads(self.decrypt(message, associated_data).decode("utf-8"))
 
-    # -- storage at rest (sensor_log.csv), ISO 27001 A.8.24 --------------
+    # -- storage helpers: IMPLEMENTED BUT NOT WIRED (ADR-029) ------------
 
     def encrypt_log_line(self, line: str) -> str:
-        """Encrypt one CSV log line for storage at rest. Returns a single
-        base64 text field safe to write as one CSV column. Reuses the same
-        AEAD primitive as the transport path -- 'nearly free once
+        """Encrypt one CSV log line into a single base64 text field safe to
+        write as one CSV column. Not called from the simulation's write
+        path -- sensor_log.csv is plaintext on disk, see ADR-029. Reuses
+        the same AEAD primitive as the transport path -- 'nearly free once
         crypto.py exists', per the handoff notes."""
         msg = self.encrypt(line.encode("utf-8"))
         return base64.b64encode(msg.to_wire()).decode("ascii")
