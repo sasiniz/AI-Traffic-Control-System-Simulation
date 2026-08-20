@@ -3676,3 +3676,139 @@ this session against the real `Simulation`, `security/channel.py` and
 (the five-signal scheme, S5's near-unreachability at real demand, and
 the HCM-vs-simulation headway distinction S2 relies on) is the primary
 source for what S1-S4 mean and why they were worth surfacing.
+
+---
+
+## ADR-038: A decision log is not self-enforcing across the documents that cite it
+
+**Date:** 2026-08-20
+**Status:** Accepted
+
+**Context**
+
+A read-only audit on 2026-08-20 found that two documents outside
+DECISIONS.md had drifted from the code in opposite directions, and one
+correction already recorded in this log had not reached a document it
+directly governs.
+
+`security/README.md` line 11 stated: *"`crypto.py` \| AES-256-GCM
+encrypt/decrypt of sensor readings in transit, and of `sensor_log.csv` at
+rest \| A.8.24 Use of cryptography."* ADR-029 (2026-08-19) had already
+established this as false and recorded an explicit mandate: *"Every
+submitted document, and every section of the dissertation, describes
+encryption in this project as protecting sensor readings in transit only.
+No document may claim at-rest protection."* `git log --follow` on
+`security/README.md` shows its only commit, `f02383a`, at 2026-08-18
+10:48:49 - one day *before* ADR-029 was written, and it was never touched
+again. The mandate was recorded correctly in the log and did not reach the
+one file whose entire job is to state the ISO 27001 control mapping ADR-029
+was correcting. The false claim was live in a tracked, examiner-readable
+file for two days before this entry.
+
+Independently, `README.md` and `CLAUDE.md` had drifted from the same
+underlying project state in opposite directions. `README.md` still
+described the schedule as generated *"annually"* and called the design
+*"annually adaptive pre-planned scheduling"* - the exact claim ADR-012
+(2026-08-04) found unachievable and replaced with a weekly horizon - and
+its Roadmap section listed the Random Forest scheduler, the encrypted
+channel, attack simulation, and the approval gate as future work, when all
+four were already built and evidenced (ADR-021, ADR-023, ADR-028). That is
+overclaiming in one respect (a horizon already abandoned) alongside
+underclaiming in another (calling finished work a roadmap item).
+`CLAUDE.md`'s "AI pipeline stages" tracker ran the same direction as the
+Roadmap error: Stage 1 marked "NEEDS CORRECTION" and Stage 2 "MUST BE
+RE-RUN" when both were already done (`models/model_card.json`'s
+`feature_columns` show the corrected 14-feature set; `results/MODEL_SELECTION.md`
+records the validation-based selection ADR-013 called for), and a "KNOWN
+INCONSISTENCY" paragraph stated `HOURLY_DEMAND` still peaked at a
+fabricated 780 vehicles/hour for North, when `traffic_sim.py:535-540`
+carries real per-(road, hour) means from `data/traffic_final_cleaned.csv`
+and its own comment already documents the fix: *"Replaces the earlier
+fabricated placeholder (North peaked at 780 vs a real mean of ~57...)."*
+
+None of this was a disagreement about what is true. In every case,
+DECISIONS.md or the code already recorded the correct state; the documents
+that summarise that state for a reader had simply not been updated to
+match. A decision log that is append-only and internally consistent, which
+this one is, does not thereby keep every other document that cites or
+depends on it in sync - each of those documents has to be revisited by
+hand every time the log changes, and nothing in this project's workflow
+forced that to happen.
+
+**Decision**
+
+`README.md`, `security/README.md`, and `CLAUDE.md` are corrected in this
+session to match the current code and the current state of this log:
+"adaptive" language and the annual-horizon claim removed from `README.md`
+in favour of ADR-012's weekly-deployable / ADR-034's disclosed-demo
+framing; the at-rest encryption claim removed from `security/README.md`
+in favour of ADR-029's wording, cited directly; `CLAUDE.md`'s stage
+tracker brought forward to mark Stages 0-5 and 7-8 as done (with Stage 6,
+the Isolation Forest, correctly still not started) and the fabricated
+`HOURLY_DEMAND` figure replaced with the real, quoted one. A new
+`results/runs/README.md` indexes every file in that directory against
+whether it is usable evidence, so the zero-row and pre-ADR-037-schema
+files sitting there under the append-only retention rule are not mistaken
+for results. No `.py` file, no data file, and no existing ADR was changed
+to make these corrections - this entry and the four documentation files
+are the entire diff.
+
+This is deliberately not a process the project is claiming to have
+solved. No mechanism is added here that would catch the next drift
+automatically; the fix is a one-time manual pass, exactly like the one
+that produced it.
+
+**Alternatives rejected**
+
+Fixing only `security/README.md` (the direct repeat of the ADR-023/029
+shape) and leaving `README.md`/`CLAUDE.md` as found. Rejected: the same
+audit that found the ADR-029 gap found the other two in the same pass, and
+leaving known-false statements uncorrected because they were not the
+ones being specifically searched for would repeat the exact failure this
+entry is about - a gap surviving because nobody happened to look at that
+file.
+
+Adding an automated check (e.g. a script that greps for "adaptive" or "at
+rest" and fails CI) instead of a manual documentation pass. Not rejected
+on merit - noted as a real future-work candidate - but out of scope for
+what "Documentation correction only" asked for this session, and this
+project has exactly one CI-shaped guard already (`Select-String -Path
+*.py -Pattern "dos|ddos|flood|denial"`, ADR-023) that is run by hand, not
+enforced automatically, which is itself evidence that adding another
+manually-run check would not have prevented this.
+
+**Consequences**
+
+Positive: `README.md`, `security/README.md`, `CLAUDE.md`, and
+`results/runs/` now describe what the repository actually contains, each
+claim traceable to a specific file and line, verified in this session
+before being written down.
+
+Negative, stated plainly: this is the second entry in this log (after
+ADR-029) whose entire content is "a correction recorded here did not
+reach a document that depends on it." The pattern is now confirmed rather
+than a one-off. Any future ADR that corrects a claim made elsewhere in the
+project should name every document that claim also appears in, not only
+DECISIONS.md, and check each one before considering the correction
+complete.
+
+Process consequence, for the Evaluation chapter alongside ADR-029's: an
+append-only decision log is necessary for an honest history but is not
+sufficient for an honest repository. The documents a reader actually
+reads first - the README, the security module's own README, the working
+notes - have to be independently re-verified against the log and the
+code, on a schedule, not assumed current because the log itself is
+correct.
+
+**Sources**
+
+Read-only audit performed 2026-08-20 against the tree at commit `434e767`
+(clean). Evidence: `git log --follow -- security/README.md` (single
+commit `f02383a`, 2026-08-18, predating ADR-029); direct read of
+`README.md`'s prior text against ADR-012 and ADR-034; direct read of
+`CLAUDE.md`'s prior "AI pipeline stages" section against
+`models/model_card.json`, `results/MODEL_SELECTION.md`, and
+`traffic_sim.py:535-540`. ADR-029 (the mandate this entry found
+unpropagated), ADR-012/034 (the horizon this entry corrected in
+`README.md`), ADR-013/015/020 (the Stage 1/2 completion this entry
+corrected in `CLAUDE.md`).

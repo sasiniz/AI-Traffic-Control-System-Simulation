@@ -8,15 +8,30 @@ is visible on `main` and directly pointable-at for marking (ADR-023).
 
 | File | Job | Primary ISO/IEC 27001:2022 Annex A control(s) |
 |---|---|---|
-| `crypto.py` | AES-256-GCM encrypt/decrypt of sensor readings in transit, and of `sensor_log.csv` at rest | A.8.24 Use of cryptography |
-| `auth.py` | bcrypt-hashed operator credentials for the manual-override dashboard | A.5.17 Authentication information; A.8.5 Secure authentication |
+| `crypto.py` | AES-256-GCM encrypt/decrypt of sensor readings **in transit only**. `encrypt_log_line`/`decrypt_log_line` also exist and pass their own unit tests, but have zero call sites outside `test_security.py` — `sensor_log.csv` is written as plaintext. See ADR-029. | A.8.24 Use of cryptography |
+| `auth.py` | bcrypt-hashed operator credentials for the approval gate | A.5.17 Authentication information; A.8.5 Secure authentication |
 | `channel.py` | The `send() -> [encryption] -> [attacker] -> receive()` abstraction the encryption toggle and attacks hang off | A.8.20 Networks security (modelled at application layer, in-process); A.8.24 Use of cryptography |
 | `attacks.py` | False data injection and sensor spoofing, as channel interceptors | Maps to the *threats* the other controls mitigate, not a control itself — cited under A.5.7 Threat intelligence and A.8.16 Monitoring activities in the risk assessment |
+| `approval.py` | SHA-256 file hash-binding and an append-only approval log, so an operator's accept is bound to the exact bytes of the schedule file, not just "someone clicked accept" | A.5.33 Protection of records; A.8.24 Use of cryptography |
 
-Two controls this project claims are demonstrated empirically, not just
+Three controls this project claims are demonstrated empirically, not just
 described: A.8.24 (the GCM tag rejection you can watch happen live by
-pressing `E`) and A.5.17/A.8.5 (a wrong operator password is rejected by
-`auth.py`, correct one is accepted).
+pressing `E`), A.5.17/A.8.5 (a wrong operator password is rejected by
+`auth.py`, correct one is accepted), and A.5.33/A.8.24 (the approval gate's
+scroll-to-end + hash-bind, below).
+
+**At-rest encryption is NOT implemented — do not claim otherwise.**
+ADR-023 originally stated that AES-256-GCM protects `sensor_log.csv` "at
+rest" as well as in transit. ADR-029 (2026-08-19) records that this was
+false of the running system: `crypto.py`'s `encrypt_log_line`/
+`decrypt_log_line` exist, are unit-tested, and are never called from
+`traffic_sim.py`'s write path. The first two lines of `sensor_log.csv` on
+disk are a plaintext CSV header followed by plaintext data. Every document
+in this project, including this one, describes encryption here as
+protecting sensor readings **in transit only**. See ADR-029 for the full
+record, including how the gap was found and why it was left unfixed for
+submission (residual-risk statement: the log holds only simulated traffic
+counts, no personal data).
 
 ## Design decisions (see ADR-023 in `DECISIONS.md` for the full record)
 
@@ -46,32 +61,55 @@ supervisor and revising the ethics form and proposal, both of which
 currently describe two attacks.
 
 **Encryption is a runtime toggle, not a deletable code path.** The `E` key
-in the dashboard should flip `channel.encryption_enabled`, not remove or
+in the dashboard flips `channel.encryption_enabled`; it does not remove or
 bypass `crypto.py`. This is what makes it possible to demonstrate the same
 attack (same interceptor instance, same channel) succeeding with encryption
 off and failing with encryption on, in one run, with one keypress.
 
-## Dashboard keys (to be wired into `traffic_sim.py`'s existing key handler)
+## Dashboard keys (implemented — `traffic_sim.py:2564-2696`)
 
 | Key | Action | Effect |
 |---|---|---|
-| `E` | Toggle encryption | Flips `channel.encryption_enabled` |
-| `1` | False data injection | `channel.add_interceptor(FalseDataInjectionAttack())` |
-| `2` | Sensor spoofing | `channel.add_interceptor(SensorSpoofingAttack())` |
-| `3` | Clear attacks | `channel.clear_interceptors()` |
+| `E` | Toggle encryption | Flips `channel.encryption_enabled` (`traffic_sim.py:2609-2611, 2664-2665`) |
+| `F` | False data injection | `channel.add_interceptor(FalseDataInjectionAttack(...))` (`:2564-2572, 2666-2667`) |
+| `G` | Sensor spoofing | `channel.add_interceptor(SensorSpoofingAttack(...))` (`:2574-2578, 2668-2669`) |
+| `H` | Clear attacks | `channel.clear_interceptors()` (`:2617, 2670-2671`) |
+| `S` | Toggle stealthy attack mode | `sim.attack_stealthy` (`:2618, 2672-2673`) |
+| `K` | Toggle key-compromise mode | `sim.attack_key_compromise` (`:2619-2620, 2674-2675`) |
 
-This project does not have `traffic_sim.py`'s current contents available in
-this session, so the exact insertion point into its event loop was not
-written as a merged file — see the separate integration snippet delivered
-alongside this folder, and treat it as something to insert, not a
-replacement file.
+Keyboard and the on-screen `SEC_BUTTONS` mouse controls share the same
+`sec_actions` dict (`traffic_sim.py:2613-2635`), so both trigger the exact
+same action — one source of truth, same reasoning as the approval gate's
+single submit path below.
 
-## Expected demonstration (measured, see `test_security.py`)
+## The approval gate (implemented — `traffic_sim.py:2375-2536`, ADR-028/031/033)
 
-| | Encryption off | Encryption on |
-|---|---|---|
-| False data injection | Dashboard shows the fake count | GCM tag fails to verify, reading rejected |
-| Sensor spoofing | Forged reading accepted as real | No valid key to forge a verifying ciphertext, rejected |
+`_run_approval_gate()` runs to completion before `Simulation()` is
+constructed, so it has no way to influence schedule content or phase
+advancement — those objects don't exist yet while it runs. The target file
+(`APPROVAL_TARGET_PATH`) is read exactly once, as raw bytes; the SHA-256
+hash, the plan-summary line, and the review pane's pivoted rows are all
+derived from that same read, never a second independent `open()`.
+
+**Scroll gate:** the ACCEPT control only enables once `scrolled_to_end` is
+true, which requires the operator to have scrolled or paged to the last
+pivoted row, or used `END` / the "jump to end" button to get there in one
+step. Both `ENTER` and a mouse click on the accept button route through the
+same `_attempt_submit()` function, so there is exactly one path that can
+approve a schedule, and both are blocked identically by the scroll check.
+
+**The ratchet is one-way:** pressing `HOME` after reaching `END` scrolls
+the view back to the top but does **not** reopen the gate —
+`scrolled_to_end` is only ever set `True`, never reset. This is deliberate:
+the control's claim is "the operator was shown the artefact's full extent",
+not "the operator is currently looking at the last row". Covered by
+`test_approval_gate_home_after_end_keeps_scroll_ratchet` in
+`test_security.py`.
+
+Approving writes one line to `security/approvals.jsonl` (gitignored,
+append-only): timestamp, username, the exact `schedule_path`, and the
+SHA-256 that was bound to that read. `verify_still_valid()` lets anyone
+re-check later whether the file on disk still matches what was approved.
 
 ## Known limitation to disclose in the dissertation
 

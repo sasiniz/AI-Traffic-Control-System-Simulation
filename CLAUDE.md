@@ -70,10 +70,11 @@ far ahead the schedule is generated. The regeneration interval is a separate
 question, settled in ADR-012 (weekly, not annually). A weekly schedule is just
 as pre-planned as an annual one.
 
-## Schedule horizon: weekly, NOT annually
-The schedule is regenerated weekly from the most recent data. Earlier versions
-of this file and the submitted project description said "annually". That was
-not achievable and has been corrected. See ADR-012.
+## Schedule horizon: weekly is deployable, annual is a disclosed demo
+The DEPLOYABLE schedule is regenerated weekly from the most recent data.
+Earlier versions of this file and the submitted project description said
+"annually". That was not achievable as a deployment horizon and has been
+corrected. See ADR-012.
 
 Why: the model's strongest features are lag features. Dropping them leaves
 calendar features only, which was measured and predicts North at 31 vehicles
@@ -81,7 +82,18 @@ per hour against an actual of 65. A Random Forest cannot predict above its
 training range, and demand roughly tripled across the dataset, so without lag
 features nothing carries the level forward.
 
-Do not reintroduce an annual horizon without also solving that problem.
+Do not reintroduce an annual horizon as the DEPLOYMENT path without also
+solving that problem.
+
+ADR-034 later adds `signal_schedule_annual.csv`: a 52-week recursive forecast
+built by feeding the model's own predictions back in as lag features once
+real data runs out, generated as a disclosed, separate DEMONSTRATION artefact,
+not a second deployment path. Its own measured error grows 2.51x from week 1
+to week 26 of the forecast horizon (`results/RECURSIVE_DEGRADATION.md`),
+which is the evidence for why it is a demo and not something to deploy as-is.
+`APPROVAL_TARGET_PATH` currently points at this artefact (ADR-036); the file
+`SignalController` actually plays back (`SIGNAL_TIMELINE_PATH`) is compiled
+separately from the weekly plan by `generate_timeline.py`.
 
 ## Feature LEGALITY at generation time
 A feature is only usable if it can be computed for the FURTHEST hour in the
@@ -189,9 +201,13 @@ width, or every position drifts.
   because changing it later means regenerating everything downstream.
 - Whether the Random Forest is kept at all. On the illegal Stage 2 feature set
   it lost to a one-line seasonal naive baseline on North and South. On the
-  corrected feature set it beats the baseline on validation, but that has not
-  yet been confirmed on the test set. See ADR-014 and ADR-015. Do not assume
-  the model survives into Stage 3 until Stage 2 has been re-run.
+  corrected feature set, Stage 2 has now been re-run with validation-based
+  model/hyperparameter selection (`model_selection.py`,
+  `results/MODEL_SELECTION.md`, ADR-020): the selected configuration
+  (RandomForest_n100_depth10, diff target) beats the baseline on the test set
+  under the rolling protocol (4.87 vs 5.22 MAE) but loses to it under the
+  static protocol (6.69 vs 5.22 MAE). See ADR-014, ADR-015, ADR-020. Which
+  protocol a downstream stage should rely on is still an open call.
 
 ## Dataset rules
 - The West road segment was extended with synthetic data covering 2015-11-01 to
@@ -267,24 +283,47 @@ pygame build is the visual and data foundation for those.
 
 ## AI pipeline stages
 0. exploratory analysis (`explore_features.py`, `export_features.py`)  DONE
-1. `data_prep.py` - feature engineering                    NEEDS CORRECTION
-     replace `roll_mean_24` with `lag_336` and
-     `roll_168_lag168`; 13 features become 14 (ADR-015)
-2. `train_model.py` - Random Forest count predictor         MUST BE RE-RUN
-     first run complete but on the illegal feature set;
-     validation-based tuning still outstanding (ADR-013)
-3. allocation layer - counts to green seconds (Webster + Ch.6 limits)
-4. replace `HOURLY_DEMAND` in traffic_sim.py with real dataset counts
-5. encrypted sensor to database channel
-6. Isolation Forest on logged sensor data
-7. observer console, bcrypt auth, signed schedule deployment
-8. attack simulation (Scapy) and evaluation
+1. `data_prep.py` - feature engineering                    DONE
+     `roll_mean_24` replaced with `lag_336` and
+     `roll_168_lag168`; 14 features, confirmed in
+     `models/model_card.json`'s `feature_columns` (ADR-015)
+2. `train_model.py` - Random Forest count predictor         DONE
+     re-run on the corrected feature set; validation-based
+     model/hyperparameter selection completed via
+     `model_selection.py` (`results/MODEL_SELECTION.md`, ADR-020)
+3. allocation layer - counts to green seconds (Webster + Ch.6 limits)  DONE
+     `generate_timeline.py`'s `allocate_green()`, ADR-021
+4. replace `HOURLY_DEMAND` in traffic_sim.py with real dataset counts  DONE
+     see traffic_sim.py:535-540 and the note below
+5. encrypted sensor channel                                  DONE (in transit only)
+     `security/channel.py` + `security/crypto.py`, wired into
+     `traffic_sim.py`; at-rest encryption of `sensor_log.csv`
+     NOT implemented - see ADR-029
+6. Isolation Forest on logged sensor data                    NOT STARTED
+7. observer console, bcrypt auth, signed schedule deployment  DONE
+     `security/auth.py` (bcrypt) + `security/approval.py`
+     (SHA-256 hash-bound, append-only approval log) behind
+     `_run_approval_gate()` in traffic_sim.py, ADR-028/031/033.
+     "Signed" here means hash-bound + logged, not a
+     cryptographic signature over a private key - state it
+     that way, don't round it up.
+8. attack simulation and evaluation                          DONE (scope-reduced)
+     `security/attacks.py`: false data injection and sensor
+     spoofing as in-process channel interceptors. Scapy /
+     packet-level network attacks and DoS/DDoS are explicitly
+     out of scope, not partially done - see security/README.md.
+     Three-condition evaluation runs are indexed in
+     `results/RESULTS_LOG.md`.
 
-Work one stage at a time. Do not start a stage before the previous one has been
-run and its output checked.
+Stages 0-5 and 7-8 are built and evidenced; only stage 6 remains genuinely
+not started. Read DECISIONS.md before extending any of the DONE stages -
+several of them (12, 021, 028, 033, 034, 036) have been amended more than
+once and the current behaviour is not always the first version described.
 
-KNOWN INCONSISTENCY, stage 4 fixes it: `HOURLY_DEMAND` in traffic_sim.py is
-placeholder data peaking at 780 vehicles/hour for North. The real dataset peaks
-at 156. Until stage 4 replaces it, the schedule and the simulation are modelling
-different junctions, and any evaluation comparing planned against delivered
-green time is meaningless.
+`HOURLY_DEMAND` in traffic_sim.py (confirmed at traffic_sim.py:535-540) now
+holds real per-(road, hour-of-day) means from `data/traffic_final_cleaned.csv`,
+not the earlier fabricated placeholder. The code's own comment: "Replaces the
+earlier fabricated placeholder (North peaked at 780 vs a real mean of ~57;
+see Phase 0 commit message for the full before/after)." North's array peaks
+at 59 (hour 19). The schedule and the simulation now model the same demand
+figures; do not reintroduce a fabricated placeholder here.
