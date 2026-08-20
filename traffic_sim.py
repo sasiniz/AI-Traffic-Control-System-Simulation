@@ -681,6 +681,7 @@ SENSOR_LOG_FIELDS = [
     "blocked_entries", "discharged_window", "green_seconds_window",
     "discharge_per_green_s", "queue_length", "mean_speed",
     "accident_active", "accident_location", "anomaly_flag",
+    "readings_sent_window", "readings_rejected_window", "signals_fired_window",
 ]
 
 CHANNEL_LOG_CAP = 20             # entries kept for the dashboard's channel log
@@ -1483,8 +1484,39 @@ class Simulation:
         if not ENABLE_LOGGING or self.sim_time < self._next_log:
             return
         self._next_log += LOG_INTERVAL_S
+        current_tick = round(self.sim_time, 1)
+
+        # Pass 1: send EVERY arm's channel reading first, before building
+        # any log_rows entry. security/detection.py's S4 (simultaneity)
+        # only means something once all four arms' channel_log entries for
+        # this tick exist - computing it arm-by-arm, interleaved with the
+        # old single-pass loop, would count "arms flagged so far" instead
+        # of "arms flagged this window". log_rows/sensors are untouched by
+        # this pass, same as before - only channel_log changes here.
+        discharged_by_arm = {}
         for arm in ARMS:
             discharged = len(self.sensors.discharges[arm])
+            discharged_by_arm[arm] = discharged
+            self._send_channel_reading(arm, discharged, self.sensors.green_s[arm])
+
+        # Classify NOW, with this tick's four channel_log entries complete,
+        # so signals_fired_window below reports THIS window rather than
+        # the previous one. update() (Section 13) still calls _classify()
+        # again right after _maybe_log() returns, for the live dashboard
+        # between ticks - that second call is idempotent here (channel_log
+        # has not changed since), not a second source of truth.
+        self._classify()
+
+        for arm in ARMS:
+            discharged = discharged_by_arm[arm]
+            this_arm_entries = [
+                e for e in self.channel_log
+                if e["sim_time"] == current_tick and e["arm"] == arm
+            ]
+            readings_sent = len(this_arm_entries)
+            readings_rejected = sum(1 for e in this_arm_entries if not e["accepted"])
+            signals_fired = ";".join(self.classification[arm].signals)
+
             self.log_rows.append({
                 "sim_time_s": round(self.sim_time, 1),
                 "clock": self.clock_string(),
@@ -1500,16 +1532,17 @@ class Simulation:
                 "accident_active": int(self.accident is not None),
                 "accident_location": self.accident.label() if self.accident else "",
                 "anomaly_flag": int(self.sensors.anomaly[arm]),
+                # S1-S4 (security/detection.py, via self.channel/
+                # self.classification) alongside anomaly_flag (S5,
+                # SensorSystem's own physical rule) - see this session's
+                # ADR: anomaly_flag alone never recorded S1-S4, so a
+                # protected and an unprotected run produced near-identical
+                # logs even when the channel behaved completely
+                # differently underneath.
+                "readings_sent_window": readings_sent,
+                "readings_rejected_window": readings_rejected,
+                "signals_fired_window": signals_fired,
             })
-
-            # Parallel operator-facing path: send this arm's discharge
-            # count through the (possibly encrypted, possibly attacked)
-            # sensor channel. This is entirely separate from the log_rows
-            # entry above - a rejected or tampered reading only ever
-            # updates channel_log for the dashboard; it is never merged
-            # back into log_rows and never touches self.sensors, so the
-            # anomaly detector and sensor_log.csv are unaffected by it.
-            self._send_channel_reading(arm, discharged, self.sensors.green_s[arm])
 
     def _send_channel_reading(self, arm, vehicles, green_seconds_window):
         # sim_time groups readings from the same _maybe_log tick together -
