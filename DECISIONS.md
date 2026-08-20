@@ -3525,3 +3525,154 @@ decision). M1-M6 evidence produced this session against the real
 `signal_schedule_annual.csv`, the real approval modal, and the real
 (backed-up-and-restored) `security/operators.json` and
 `security/approvals.jsonl`.
+
+---
+
+## ADR-037: sensor_log.csv records S1-S4 channel verdicts, not only S5
+
+**Date:** 2026-08-20
+**Status:** Accepted
+
+**Context**
+
+`anomaly_flag`, the only detection column `sensor_log.csv` carried
+before this entry, is `int(self.sensors.anomaly[arm])` -
+`SensorSystem`'s physical rule (queue present, green time available,
+throughput collapsed; this is S5 in `security/detection.py`'s five-
+signal scheme). `security/detection.py` also computes S1
+(`INTEGRITY_FAIL`, an AEAD verification failure), S2 (`IMPLAUSIBLE`, a
+reported count exceeding what this simulation's own physics could have
+discharged), S3 (`DIVERGENCE`, reported value differs from what was
+actually sent), and S4 (`SIMULTANEITY`, three or more arms flagged in
+the same window) - all real signals, computed every tick
+(`Simulation._classify()`, `traffic_sim.py`), stored in
+`self.classification`, and shown live on the dashboard's threat panel.
+None of the four ever reached the CSV. The practical consequence,
+verified this session before any code changed: a headless run with
+`false_data_injection` fired and encryption OFF, and the identical run
+with encryption ON, produced logs differing only in whichever rows
+happened to also trip S5 - which, per `security/detection.py`'s own
+documented finding, is essentially never at real demand
+(`DEMAND_MULTIPLIER=1.0`). A reader of `sensor_log.csv` alone, without
+also watching the live dashboard, had no way to tell a cryptographically
+defeated attack from an untouched normal run.
+
+**Decision**
+
+Three columns added to `SENSOR_LOG_FIELDS` after `anomaly_flag`:
+`readings_sent_window`, `readings_rejected_window`,
+`signals_fired_window` (semicolon-separated S-codes from
+`self.classification[arm].signals`, empty string if none).
+`anomaly_flag`'s own computation is untouched - this entry adds
+visibility into S1-S4, it does not touch S5, `ANOMALY_RATE_MIN`, or any
+other constant `security/detection.py`'s or `SensorSystem`'s rules
+depend on.
+
+`Simulation._maybe_log()` required reordering, not just extending, to
+make this correct rather than merely present. STEP 0 found the state
+already existed (`self.channel_log`, populated by
+`_send_channel_reading`; `self.classification`, populated by
+`_classify()`) and was retained for long enough (`CHANNEL_LOG_CAP=20`
+entries = 5 ticks at 4 arms/tick), so nothing needed to be tracked that
+was not already tracked. What STEP 0 also found: the OLD `_maybe_log()`
+interleaved building each arm's `log_rows` entry with sending that
+arm's channel reading, in one pass over `ARMS`, and `_classify()` ran
+only afterward (`Simulation.update()`, unchanged call order:
+`_maybe_log()` then `_classify()`). Reading `self.classification[arm]`
+at the old call site would have returned the PREVIOUS window's
+verdict, not the current one - stale by exactly one `LOG_INTERVAL_S`
+(10s). Worse for S4 specifically: even mid-window, `simultaneity_flag`
+needs all four arms' entries for the tick to count "3+ arms flagged"
+correctly, which is not true until the per-arm loop finishes. Fixed by
+splitting `_maybe_log()` into two passes: send all four channel
+readings first, call `_classify()` once (a pure, side-effect-free
+recompute of `self.classification` from now-complete state - the
+existing call after `_maybe_log()` returns is unaffected and simply
+recomputes the same, now-unchanged result a moment later), then build
+all four CSV rows from the current classification. This is recorded as
+a finding in its own right: "add a column reading existing state"
+looked, before STEP 0, like it should not need to touch control flow
+at all.
+
+**Review evidence (P1-P7), against the real simulation, not a mock:**
+
+P1 (encryption OFF, `false_data_injection`, headless, seed 42): rows
+at `sim_time_s` 10/20/30 for North show `readings_rejected_window=0`
+with `reported_vehicles=999` (the crude attack's fixed poisoned value,
+accepted because encryption off has no integrity check) and
+`signals_fired_window` = `S2_IMPLAUSIBLE;S3_DIVERGENCE;S4_SIMULTANEITY`
+(South/East/West show `S3_DIVERGENCE;S4_SIMULTANEITY` - S2 needs
+`green_seconds_window >= S2_MIN_GREEN_S`, which those particular rows
+did not reach; S4 fires uniformly across all arms once 3+ are flagged,
+per its own cross-arm design).
+
+P2 (same attack, encryption ON): the same rows now show
+`readings_rejected_window=1` and `signals_fired_window` =
+`S1_INTEGRITY_FAIL;S4_SIMULTANEITY` throughout - the attacker holds no
+key, so `_tamper_without_key` corrupts the ciphertext, AEAD
+verification fails, and `ChannelRejected` fires for every arm every
+tick.
+
+P3 (clean run, no attack, seed 42): `readings_sent_window` is 1 on
+every one of 12 rows (sum 12, only value 1 - see Consequences, below,
+for why this is a constant under the current architecture rather than
+a bug), `readings_rejected_window` is 0 throughout (sum 0), and
+`signals_fired_window` is the empty string on all 12 rows.
+
+P4: `sensor_log.csv` still parses via `pandas.read_csv(comment='#')`;
+column count (17) matches `len(SENSOR_LOG_FIELDS)` exactly.
+
+P5: `anomaly_flag`'s computation is unchanged, shown by diff rather
+than re-argued - `git diff` on this session's change shows
+`"anomaly_flag": int(self.sensors.anomaly[arm]),` as an unchanged
+context line, and the `SensorSystem` class (where `.anomaly` is
+actually computed) carries zero diff at all.
+
+P6: full suite 43/43, same total as every session since this project
+started counting.
+
+P7: `SignalController` (719-792), `Vehicle.update` (1025-1074),
+`Simulation._leaders` (1334-1405) - scoped grep for `rejected`,
+`signals`, `channel`, case-insensitive, inside those three ranges only:
+zero hits.
+
+**Consequences**
+
+Positive: `sensor_log.csv` alone (no live dashboard required) now
+distinguishes "attack fired, channel caught it" from "attack fired,
+channel did not catch it" from "no attack" - the three scenarios P1-P3
+demonstrate. This is the evidence a written report needs to show
+encryption's actual effect without requiring a screen recording of the
+dashboard.
+
+Disclosed rather than left implicit: `readings_sent_window` is 1 on
+every row under the current architecture (`_send_channel_reading` is
+called exactly once per arm per `_maybe_log()` tick), confirmed by P3.
+It is not a wasted column - a reader needs it to interpret
+`readings_rejected_window` correctly (rejected count is always out of
+this many sent), and it stops being a constant automatically if a
+future change ever sends more than one reading per arm per window -
+but as shipped, it carries no additional information beyond
+`readings_rejected_window` on its own. Recorded here so a future reader
+does not spend time looking for variation that is not there yet by
+design.
+
+The `_classify()` reordering means it is now called twice on every
+logging tick (once inside `_maybe_log()`, once immediately after, from
+`Simulation.update()`'s existing, unmodified call). This is redundant
+computation, not a correctness risk - `_classify()` is a pure function
+of `self.channel_log`/`self.sensors.anomaly`/`self.accident`/
+`self.channel.encryption_enabled`, none of which change between the
+two calls - but it is a real, minor inefficiency this entry introduces
+and does not remove. Not addressed here because removing the second
+call would mean touching `Simulation.update()`'s call order, which
+this session's brief scoped to "the log row builder" only.
+
+**Sources**
+
+None, design decision. STEP 0 investigation and P1-P7 evidence produced
+this session against the real `Simulation`, `security/channel.py` and
+`security/detection.py`. `security/detection.py`'s own module docstring
+(the five-signal scheme, S5's near-unreachability at real demand, and
+the HCM-vs-simulation headway distinction S2 relies on) is the primary
+source for what S1-S4 mean and why they were worth surfacing.
